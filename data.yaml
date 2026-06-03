@@ -1,0 +1,19 @@
+path: ./insect_dataset  # 指向你的昆蟲資料夾根目錄
+train: train/images     # 訓練照片路徑
+val: valid/images       # 驗證照片路徑
+test: test/images       # 測試照片路徑
+
+nc: 12                  # 總共有 12 種生態昆蟲
+names:
+  0: Ants
+  1: Bees
+  2: Beetles
+  3: Caterpillars
+  4: Earthworms
+  5: Earwigs
+  6: Grasshoppers
+  7: Moths
+  8: Slugs
+  9: Snails
+  10: Wasps
+  11: Weevils
