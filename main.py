@@ -11,6 +11,9 @@ import pymysql
 import io
 import os
 
+# 💡 引入 actuators.py 裡面的全域單例硬體控制器
+from actuators import actuator_controller 
+
 load_dotenv()
 
 # 🧠 宣告雙核心專家大腦
@@ -25,6 +28,17 @@ def get_db_connection():
         database=os.getenv("DB_NAME", "smart_eco_farm_db"),
         charset="utf8mb4"
     )
+
+# 💡 定義從 sensors.py 傳過來的 IoT 資料格式
+class SensorPayload(BaseModel):
+    device_id: str
+    temperature: float
+    humidity: float
+    soil_moisture: float
+
+# 💡 定義自動化的環境安全門檻（配合測試已放寬標準）
+TEMP_THRESHOLD = 28.0      # 氣溫高於 28°C 就開風扇
+HUMIDITY_THRESHOLD = 65.0  # 濕度低於 65% 就開水泵灑水
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -146,7 +160,7 @@ def detect_bugs(file: UploadFile = File(...)):
             res_insect[0].save(filename=file_location)
             
         else:
-            # 如果畫面上沒有發現任何蟲子框框，轉交給植物病變分類大腦！
+            # 如果畫面上沒有發現 any 蟲子框框，轉交給植物病變分類大腦！
             if hasattr(res_disease[0], 'probs') and res_disease[0].probs is not None:
                 top1_idx = int(res_disease[0].probs.top1)
                 diagnosis = model_disease.names[top1_idx]
@@ -163,5 +177,75 @@ def detect_bugs(file: UploadFile = File(...)):
         conn.close()
 
         return {"status": "success", "diagnosis": diagnosis, "confidence": round(top_confidence, 2)}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# 💡 核心整合功能：自動化環控並連動寫入網頁戰情室日誌
+@app.post("/api/v1/sensors")
+def receive_sensor_data(data: SensorPayload):
+    try:
+        print(f"📊 [接收數據] {data.device_id} -> 氣溫: {data.temperature}°C, 濕度: {data.humidity}%, 土壤: {data.soil_moisture}%")
+        
+        log_messages = []
+        db_actions = []
+
+        # 🌬️ 1. 氣溫環境監控邏輯 (排風扇控制)
+        if data.temperature > TEMP_THRESHOLD:
+            if actuator_controller.set_fan("ON"):
+                action_text = f"自動觸發：因氣溫過高 ({data.temperature}°C) 開啟排風扇降溫"
+                log_messages.append(f"🔥 {action_text}")
+                db_actions.append(action_text)
+        else:
+            if actuator_controller.set_fan("OFF"):
+                if actuator_controller.fan_status == "ON": # 只有原本開著才記錄關閉
+                    action_text = f"自動觸發：氣溫回落 ({data.temperature}°C) 關閉排風扇"
+                    log_messages.append(f"🍃 {action_text}")
+                    db_actions.append(action_text)
+
+        # 💦 2. 濕度環境監控邏輯 (灌溉水泵控制)
+        if data.humidity < HUMIDITY_THRESHOLD:
+            if actuator_controller.set_pump("ON"):
+                action_text = f"自動觸發：因環境濕度過低 ({data.humidity}%) 開啟變頻灌溉水泵"
+                log_messages.append(f"🚨 {action_text}")
+                db_actions.append(action_text)
+        else:
+            if actuator_controller.set_pump("OFF"):
+                if actuator_controller.pump_status == "ON": # 只有原本開著才記錄關閉
+                    action_text = f"自動觸發：環境濕度達標 ({data.humidity}%) 關閉變頻灌溉水泵"
+                    log_messages.append(f"✅ {action_text}")
+                    db_actions.append(action_text)
+
+        # 📝 3. 完美對接 farm_app.py 的 system_audit_logs 資料表
+        if db_actions:
+            try:
+                conn = get_db_connection()
+                with conn.cursor() as cursor:
+                    # 確保資料表存在（結構完全對接網頁端）
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS system_audit_logs (
+                            id INT AUTO_INCREMENT PRIMARY KEY,
+                            user VARCHAR(50),
+                            action VARCHAR(255),
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    
+                    # 寫入自動化控制紀錄，操作者設定為 'system'
+                    for action in db_actions:
+                        cursor.execute("INSERT INTO system_audit_logs (user, action) VALUES (%s, %s)", ('system', action))
+                conn.commit()
+                conn.close()
+                print("📝 [資料庫同步成功] 邊緣硬體控制事件已寫入 system_audit_logs")
+            except Exception as db_err:
+                print(f"⚠️ [資料庫寫入失敗] 原因: {db_err}")
+
+        # 4. 組裝回傳封包給 sensors.py 端顯示
+        alert_info = " | ".join(log_messages) if log_messages else "環境數據穩定，硬體設備維持現狀。"
+        return {
+            "status": "success",
+            "message": "感測器核心數據已同步接收",
+            "alert": f"【系統核心決策】{alert_info}"
+        }
+        
     except Exception as e:
         return {"status": "error", "message": str(e)}
