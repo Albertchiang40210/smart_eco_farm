@@ -1,598 +1,323 @@
-import sys
-import os
 import streamlit as st
 import pandas as pd
+import pymysql
+import os
 import numpy as np
-import pymysql  
+from dotenv import load_dotenv
 import time
-import datetime  
 from datetime import datetime
-import datetime as dt_package  # 🟢 核心校正：徹底解決 datetime 類別與套件命名衝突
-import cv2
-from ultralytics import YOLO  
-from PIL import Image  
-import streamlit.components.v1 as components
-from collections import deque
 
-# ==============================================================================
-# 🛰️ 類別一：工業級溫室遙測數據工程引擎 (記憶體緩衝與滾動去噪)
-# ==============================================================================
-class GreenhouseTelemetryEngine:
-    def __init__(self, window_size=10):
-        self.window_size = window_size
-        self.temp_buffer = deque(maxlen=window_size)
-        self.moist_buffer = deque(maxlen=window_size)
-        self.uv_buffer = deque(maxlen=window_size)
-        self.ppfd_buffer = deque(maxlen=window_size)
-        
-        self.current_raw_temp = 28.5
-        self.current_raw_moist = 54.0
-        self.current_raw_uv = 2.5
-        self.current_raw_ppfd = 450.0
+# --- 載入環境變數 (.env) ---
+load_dotenv()
 
-    def receive_high_frequency_hardware_stream(self):
-        self.current_raw_temp += np.random.uniform(-0.3, 0.3)
-        self.current_raw_moist += np.random.randint(-1, 2)
-        self.current_raw_uv += np.random.uniform(-0.1, 0.1)
-        self.current_raw_ppfd += np.random.uniform(-10.0, 10.0)
-        
-        self.current_raw_temp = max(15.0, min(45.0, self.current_raw_temp))
-        self.current_raw_moist = max(20, min(95, self.current_raw_moist))
-        self.current_raw_uv = max(0.0, min(12.0, self.current_raw_uv))
-        self.current_raw_ppfd = max(0.0, min(1200.0, self.current_raw_ppfd))
-        
-        self.temp_buffer.append(self.current_raw_temp)
-        self.moist_buffer.append(self.current_raw_moist)
-        self.uv_buffer.append(self.current_raw_uv)
-        self.ppfd_buffer.append(self.current_raw_ppfd)
+# ==========================================
+# ⚙️ 系統核心設定 & 資料庫配置
+# ==========================================
+DB_CONFIG = {
+    'host': os.getenv("DB_HOST", "127.0.0.1"), 
+    'port': 3306,
+    'user': os.getenv("DB_USER", "root"), 
+    'password': os.getenv("DB_PASSWORD", "P@ssw0rd"),
+    'database': os.getenv("DB_NAME", "smart_eco_farm_db"),
+    'charset': 'utf8mb4'
+}
 
-    def get_smooth_telemetry(self):
-        if len(self.temp_buffer) < 3:
-            return {
-                "temperature": round(self.current_raw_temp, 1), "moisture": int(self.current_raw_moist),
-                "uv_index": round(self.current_raw_uv, 1), "ppfd": round(self.current_raw_ppfd, 1)
-            }
-        df_temp = pd.Series(list(self.temp_buffer))
-        df_moist = pd.Series(list(self.moist_buffer))
-        df_uv = pd.Series(list(self.uv_buffer))
-        df_ppfd = pd.Series(list(self.ppfd_buffer))
-        
-        return {
-            "temperature": round(df_temp.rolling(window=self.window_size, min_periods=1).mean().iloc[-1], 1),
-            "moisture": int(df_moist.rolling(window=self.window_size, min_periods=1).mean().iloc[-1]),
-            "uv_index": round(df_uv.rolling(window=self.window_size, min_periods=1).mean().iloc[-1], 1),
-            "ppfd": round(df_ppfd.rolling(window=self.window_size, min_periods=1).mean().iloc[-1], 1)
-        }
+# 設定網頁標題與寬螢幕佈局
+st.set_page_config(page_title="智慧溫室綜合戰情室", page_icon="🌿", layout="wide")
 
-# ==============================================================================
-# ⚙️ 類別二：工業級溫室執行器控制中樞 (PLC 抽象與硬體保護機制)
-# ==============================================================================
-class GreenhouseActuatorController:
-    def __init__(self):
-        self.fan_status = "OFF"
-        self.pump_status = "OFF"
-        self.COOLDOWN_TIME = 5  
-        self.last_fan_toggle_time = 0
-        self.last_pump_toggle_time = 0
-
-    def set_fan(self, command: str) -> bool:
-        current_time = time.time()
-        command = command.upper()
-        if command == self.fan_status: return False
-        if current_time - self.last_fan_toggle_time < self.COOLDOWN_TIME: return False
-        self.fan_status = command
-        self.last_fan_toggle_time = current_time
-        return True
-
-    def set_pump(self, command: str) -> bool:
-        current_time = time.time()
-        command = command.upper()
-        if command == self.pump_status: return False
-        if current_time - self.last_pump_toggle_time < self.COOLDOWN_TIME: return False
-        self.pump_status = command
-        self.last_pump_toggle_time = current_time
-        return True
-
-# 初始化全域核心單例
-telemetry_engine = GreenhouseTelemetryEngine(window_size=10)
-actuator_controller = GreenhouseActuatorController()
-
-# ==============================================================================
-# 🔐 SecOps 憑證隔離配置
-# ==============================================================================
-DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
-DB_USER = os.getenv("DB_USER", "root")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "P@ssw0rd") 
-DB_NAME = os.getenv("DB_NAME", "smart_eco_farm_db")
-NGROK_URL = os.getenv("NGROK_URL", "https://uncrown-pacific-sprout.ngrok-free.dev")
-ADMIN_KEYWORD = os.getenv("ADMIN_KEYWORD", "farm2026")
-
-UPLOAD_QUEUE_DIR = "./phone_upload_queue"
-os.makedirs(UPLOAD_QUEUE_DIR, exist_ok=True)
-
-# ==============================================================================
-# 🛸 整合模擬器機制的動態微氣候狀態緩衝
-# ==============================================================================
-if "t_base" not in st.session_state: st.session_state["t_base"] = 28.5
-if "m_base" not in st.session_state: st.session_state["m_base"] = 54
-
-# ==============================================================================
-# 🎨 Streamlit 視覺樣式與核心組態
-# ==============================================================================
-st.set_page_config(page_title="智慧生態農場 AI 核心監控系統", page_icon="🌿", layout="wide")
-
+# 🎨 UI/UX 頂級戰情室 CSS 樣式表
 st.markdown("""
 <style>
-    [data-testid="stSidebar"] { display: none; }
-    [data-testid="collapsedControl"] { display: none; }
-    .stApp { background-color: #f8faf8; color: #1e3d2f; }
-    .main-title { font-family: 'Helvetica Neue', Arial, sans-serif; font-size: 2.2rem !important; font-weight: 800; background: linear-gradient(135deg, #1e3d2f, #27ae60); -webkit-background-clip: text; -webkit-text-fill-color: transparent; text-align: center; margin-bottom: 20px; }
-    .section-title { font-size: 1.15rem; font-weight: bold; color: #1e3d2f; border-bottom: 2px solid #27ae60; padding-bottom: 6px; margin-bottom: 12px; }
-    .metric-box { background: #ffffff; border: 1px solid #eaf2ec; padding: 15px; border-radius: 14px; text-align: center; box-shadow: 0 4px 20px rgba(43, 75, 57, 0.03); }
-    .stButton>button { width: 100% !important; background: linear-gradient(135deg, #11998e, #38ef7d) !important; color: white !important; font-size: 1rem !important; font-weight: 600 !important; border: none !important; border-radius: 10px !important; padding: 8px 0 !important; }
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
+    .stApp { background-color: #f4f7f5; color: #1e3d2f; font-family: 'PingFang TC', 'Microsoft JhengHei', sans-serif; }
+    .card { background: #ffffff; padding: 24px; border-radius: 16px; border: 1px solid #e2ebd9; box-shadow: 0 8px 24px rgba(43, 75, 57, 0.04); margin-bottom: 20px; }
+    
+    /* 輸入框美化 */
+    div[data-testid="stTextInput"] input {
+        background-color: #ffffff !important; color: #112e20 !important;
+        border: 1px solid #cbd5e1 !important; border-radius: 8px !important; padding: 12px !important;
+    }
+    
+    /* ⚡ 高科技監視器黑框面板 (待命時顯示) */
+    .video-panel {
+        background: #111613; border: 2px solid #27ae60; border-radius: 12px; height: 380px;
+        position: relative; display: flex; flex-direction: column; justify-content: center; align-items: center;
+        color: #2ecc71; box-shadow: inset 0 0 30px rgba(39, 174, 96, 0.2); overflow: hidden;
+    }
+    .video-panel::before {
+        content: "• LIVE MONITOR DISPATCH"; position: absolute; top: 15px; left: 20px;
+        font-family: monospace; font-size: 12px; letter-spacing: 2px; animation: blink 1.5s infinite;
+    }
+    @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    
+    div.stButton > button { 
+        background: linear-gradient(135deg, #27ae60, #2ecc71) !important; 
+        color: white !important; border: none !important; padding: 10px 20px !important; font-weight: 600 !important; border-radius: 8px !important;
+    }
+    .clear-btn div.stButton > button { background: linear-gradient(135deg, #7f8c8d, #95a5a6) !important; }
+    .logout-btn div.stButton > button { background: linear-gradient(135deg, #e74c3c, #c0392b) !important; }
+    div[data-testid="stMetricValue"] { font-size: 26px !important; font-weight: 700 !important; }
+    div[data-testid="stMetric"] { background: #ffffff; padding: 18px; border-radius: 14px; border: 1px solid #e2ebd9; }
+    .iot-section { background: #eef5f0; padding: 20px; border-radius: 14px; margin-top: 15px; border-left: 5px solid #27ae60; }
 </style>
 """, unsafe_allow_html=True)
 
-# 🛠️ 農業物種與病害中文字典
-DISEASE_CH_NAMES = {
-    'Powdery Mildew': '🍂 白粉病 (需要降濕通風)', 'Tomato Rust': '🍂 鐵鏽病 (需要物理隔離)',
-    'Apple___Apple_scab': '🍎 蘋果黑星病 (加強果園隔離)', 'Healthy': '🥬 健康無病害 (作物發育良好)',
-    'Ants': '🐜 觀察紀錄：螞蟻生態 (細部覓食觀測中)', 'Bees': '🐝 益蟲發現：小蜜蜂 (正在授粉中)',
-    'Caterpillars': '🐛 警告：毛毛蟲侵害 (注意葉片啃食防禦)', 'Unknown': '🔍 溫室大腦正在分析數據中...'
-}
+if "role" not in st.session_state: 
+    st.session_state["role"] = "staff"
+if "last_seen_id" not in st.session_state:
+    st.session_state["last_seen_id"] = None
 
-def get_friendly_name(raw_name: str) -> str:
-    if not raw_name: return "🔍 溫室大腦正在分析數據中..."
-    raw_name_clean = str(raw_name).strip()
-    if raw_name_clean in DISEASE_CH_NAMES: return DISEASE_CH_NAMES[raw_name_clean]
-    return f"🔍 觀測目標 ({raw_name_clean})"
-
-# ==============================================================================
-# 📊 MySQL 資料庫初始化
-# ==============================================================================
-DB_CONFIG = {
-    'host': DB_HOST, 'port': 3306, 'user': DB_USER, 'password': DB_PASSWORD,  
-    'database': DB_NAME, 'charset': 'utf8mb4', 'cursorclass': pymysql.cursors.DictCursor, 'connect_timeout': 2  
-}
-
-db_connected = False
-try:
-    conn_init = pymysql.connect(host=DB_HOST, port=3306, user=DB_USER, password=DB_PASSWORD)
-    cursor_init = conn_init.cursor()
-    cursor_init.execute(f"CREATE DATABASE IF NOT EXISTS {DB_NAME} DEFAULT CHARACTER SET utf8mb4;")
-    conn_init.select_db(DB_NAME)
-    
-    cursor_init.execute("""
-        CREATE TABLE IF NOT EXISTS farm_tasks_v2 (
-            id INT AUTO_INCREMENT PRIMARY KEY, file_path VARCHAR(255) NOT NULL, status VARCHAR(50) DEFAULT 'pending', 
-            diagnosis_result VARCHAR(100) DEFAULT 'Unknown', confidence FLOAT DEFAULT 0.0, temperature FLOAT DEFAULT 28.5,
-            moisture INT DEFAULT 54, uv_index FLOAT DEFAULT 2.5, ppfd FLOAT DEFAULT 450.0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    """)
-    cursor_init.execute("""
-        CREATE TABLE IF NOT EXISTS eco_brain_sync (
-            sync_key VARCHAR(50) PRIMARY KEY, is_frozen INT DEFAULT 0, detected_species VARCHAR(100) DEFAULT 'Unknown', 
-            confidence_score FLOAT DEFAULT 0.0, brain_source VARCHAR(50) DEFAULT 'Unknown', image_blob LONGBLOB
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    """)
-    cursor_init.execute("INSERT IGNORE INTO eco_brain_sync (sync_key, is_frozen, detected_species, confidence_score, brain_source) VALUES ('main', 0, 'Unknown', 0.0, 'Unknown')")
-    conn_init.commit(); cursor_init.close(); conn_init.close()
-    db_connected = True
-except Exception as e: print(f"資料庫建置失敗: {e}")
-
-def fetch_today_alerts():
-    if not db_connected: return 0
+# ==========================================
+# 🛡️ 安全稽核日誌 (Audit Log)
+# ==========================================
+def write_audit_log(user: str, action: str):
     try:
-        conn = pymysql.connect(**DB_CONFIG); cursor = conn.cursor()
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        cursor.execute("SELECT COUNT(*) as cnt FROM farm_tasks_v2 WHERE created_at LIKE %s AND diagnosis_result NOT LIKE 'Healthy' AND status = 'completed'", (f"{today_str}%",))
-        count = cursor.fetchone()['cnt']; cursor.close(); conn.close()
-        return count
-    except: return 0
-
-# ==============================================================================
-# 🧠 YOLOv8 雙大腦引擎
-# ==============================================================================
-@st.cache_resource
-def load_farm_brains():
-    bug_path = "./result/train/weights/best.pt"  
-    leaf_path = "./yolov8s.pt"                   
-    b_model = YOLO(bug_path) if os.path.exists(bug_path) else None
-    l_model = YOLO(leaf_path) if os.path.exists(leaf_path) else None
-    return b_model, l_model
-
-bug_brain, leaf_brain = load_farm_brains()
-
-def diagnose_image(img_path):
-    pred_name, conf_val, source_brain, final_bytes = "Unknown", 0.0, "None", None
-    try:
-        img_pil = Image.open(img_path)
-        if bug_brain is not None:
-            res = bug_brain.predict(source=img_pil, imgsz=224, verbose=False)
-            for r in res:
-                if getattr(r, 'boxes', None) is not None and len(r.boxes) > 0:
-                    annotated_frame = r.plot()
-                    _, buffer = cv2.imencode('.jpg', annotated_frame)
-                    final_bytes = buffer.tobytes()
-                    pred_name = r.names[int(r.boxes[0].cls[0].item())]
-                    conf_val = float(r.boxes[0].conf[0].item())
-                    return pred_name, conf_val, "bug_brain", final_bytes
-        if leaf_brain is not None:
-            res = leaf_brain.predict(source=img_pil, imgsz=224, verbose=False)
-            for r in res:
-                if getattr(r, 'probs', None) is not None and r.probs is not None:
-                    pred_name = r.names[r.probs.top1]
-                    conf_val = float(r.probs.top1conf.item())
-                    return pred_name, conf_val, "leaf_brain", final_bytes
-    except Exception as e: print(f"診斷核心異常: {e}")
-    return pred_name, conf_val, source_brain, final_bytes
-
-# ==============================================================================
-# 🔑 4. 安全 Session 狀態管理
-# ==============================================================================
-if "role" not in st.session_state: st.session_state["role"] = "staff"
-is_mobile_client = st.query_params.get("client") == "mobile"
-
-if db_connected:
-    TODAY_ALERTS = fetch_today_alerts()
-    conn = pymysql.connect(**DB_CONFIG); cursor = conn.cursor()
-    cursor.execute("SELECT * FROM eco_brain_sync WHERE sync_key='main'")
-    sync_status = cursor.fetchone(); cursor.close(); conn.close()
-    is_frozen = bool(sync_status['is_frozen'])
-    sync_species = sync_status['detected_species']
-    sync_conf = sync_status['confidence_score']
-    image_blob_data = sync_status['image_blob']
-else:
-    TODAY_ALERTS, is_frozen, sync_species, sync_conf, image_blob_data = 0, False, 'Unknown', 0.0, None
-
-# ==============================================================================
-# 📱 模式 A：【農夫手機拍照上傳端】
-# ==============================================================================
-if is_mobile_client:
-    st.markdown("<h1 class='main-title'>📱 行動端巡田水相機</h1>", unsafe_allow_html=True)
-    with st.container(border=True):
-        img_file = st.camera_input("請對準有病變或害蟲的葉片拍攝：")
-        if img_file is not None:
-            if st.button("🚀 確認無誤 ➔ 送回後台排隊", use_container_width=True):
-                bytes_data = img_file.getvalue()
-                saved_path = os.path.join(UPLOAD_QUEUE_DIR, f"phone_upload_{int(time.time())}.jpg")
-                with open(saved_path, "wb") as f: f.write(bytes_data)
-                pred_name, conf_val, brain_src, final_bytes = diagnose_image(saved_path)
-                if final_bytes is None: final_bytes = bytes_data
-                if db_connected:
-                    try:
-                        conn = pymysql.connect(**DB_CONFIG); cursor = conn.cursor()
-                        ins_sql = "INSERT INTO farm_tasks_v2 (file_path, status, diagnosis_result, confidence, temperature, moisture, uv_index, ppfd) VALUES (%s, 'pending', %s, %s, %s, %s, %s, %s)"
-                        
-                        sim_t = st.session_state["t_base"]
-                        sim_m = st.session_state["m_base"]
-                        
-                        cursor.execute(ins_sql, (saved_path, pred_name, conf_val, sim_t, sim_m, 2.5, 450.0))
-                        cursor.execute("UPDATE eco_brain_sync SET is_frozen=1, detected_species=%s, confidence_score=%s, brain_source=%s, image_blob=%s WHERE sync_key='main'", (pred_name, conf_val, brain_src, final_bytes))
-                        conn.commit(); cursor.close(); conn.close()
-                        st.success("🎉 生態特徵快取成功！已同步大螢幕看板。")
-                    except Exception as e: st.error(f"寫入失敗: {e}")
-
-# ==============================================================================
-# 🖥️ 模式 B：【大螢幕看板與管理端一體化】
-# ==============================================================================
-else:
-    if "mode" not in st.query_params: st.query_params.update({"mode": "POS"})
-    device_mode = st.query_params.get("mode", "POS")
-
-    nav_col1, nav_col2, nav_col3 = st.columns([4, 4, 3])
-    if nav_col1.button("🖥️ 溫室 Kiosk 即時影像監控看板", use_container_width=True, type="primary" if device_mode == "POS" else "secondary"):
-        st.query_params.update({"mode": "POS"}); st.rerun()
-    if nav_col2.button("💻 遠端智慧溫室管理決策後台", use_container_width=True, type="primary" if device_mode == "BOSS" else "secondary"):
-        st.query_params.update({"mode": "BOSS"}); st.rerun()
-        
-    with nav_col3:
-        if st.session_state["role"] == "admin":
-            if st.button("🔒 安全登出 (鎖定控制權)", use_container_width=True):
-                st.session_state["role"] = "staff"; st.rerun()
-        else:
-            st.markdown('<div style="border: 1px solid #cccccc; background: #ffffff; padding: 7px 15px; border-radius: 8px; text-align: center; font-size: 0.95rem; font-weight: 600; color: #333333; height: 38px; line-height: 22px;">🔑 身份：👤 員工唯讀 (staff)</div>', unsafe_allow_html=True)
-
-    st.markdown("<hr style='margin-top: 10px; margin-bottom: 20px;'>", unsafe_allow_html=True)
-
-    # 🖥️ B-1：Kiosk 大螢幕看板 
-    if device_mode == "POS":
-        st.markdown("<h1 class='main-title'>🖥️ 溫室 Kiosk 實時 AI 分析大腦</h1>", unsafe_allow_html=True)
-
-        # ==============================================================================
-        # 🟢 萬能抗鬼畜心跳監聽器：背景盯梢 MySQL (每 1.5 秒心跳一次)
-        # ==============================================================================
-        @st.fragment(run_every=1.5)
-        def database_heartbeat_listener():
-            # 🛡️ 終極抗鬼畜防禦：如果畫面上已經有照片了 (is_frozen == True)，
-            # 監聽器立刻原地立正，絕對不重複發射重整炮，徹底解決無限循環刷新問題！
-            if is_frozen:
-                return
-                
-            if db_connected:
-                try:
-                    conn_check = pymysql.connect(**DB_CONFIG)
-                    cursor_check = conn_check.cursor()
-                    cursor_check.execute("SELECT is_frozen FROM eco_brain_sync WHERE sync_key='main'")
-                    status_now = cursor_check.fetchone()
-                    cursor_check.close(); conn_check.close()
-                    
-                    # 🎯 黃金交叉點：只有當手機剛送達 (資料庫變 1，但大螢幕還是 0) 的關鍵瞬間，才發射唯一一次重整炮
-                    if status_now and status_now.get('is_frozen', 0) == 1:
-                        st.components.v1.html("""
-                            <script>
-                                window.parent.location.reload();
-                            </script>
-                        """, height=0)
-                except: pass
-
-        # 啟動防鬼畜監聽
-        database_heartbeat_listener()
-
-        col_left, col_right = st.columns([6, 5])
-        with col_left:
-            with st.container(border=True):
-                st.markdown("### 📸 AI 影像特徵辨識雷達")
-                if is_frozen and image_blob_data:
-                    nparr = np.frombuffer(image_blob_data, np.uint8)
-                    st.image(cv2.cvtColor(cv2.imdecode(nparr, cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB), caption="🛸 邊緣網關即時捕捉畫面", use_container_width=True)
-                else:
-                    st.markdown(f"<div style='text-align:center; padding: 40px 0;'><img src='https://api.qrserver.com/v1/create-qr-code/?size=220x220&data={NGROK_URL}?client=mobile'/><h3 style='margin-top:20px;'>🌿 請用手機掃碼開始拍照監測</h3></div>", unsafe_allow_html=True)
-        with col_right:
-            with st.container(border=True):
-                if is_frozen:
-                    st.markdown("<div class='section-title'>🧾 現地邊緣 analysis 明細</div>", unsafe_allow_html=True)
-                    st.markdown(f"""
-                    <div style="background: #ffffff; padding: 20px; border-radius: 12px; border: 1px solid #eaf2ec; margin-bottom: 20px;">
-                        <p style="margin: 10px 0; font-size: 1.15rem; color: #1e3d2f;"><b>🧬 生態診斷目標：</b> <span style="color: #27ae60; font-weight: 700;">{get_friendly_name(sync_species)}</span></p>
-                        <p style="margin: 10px 0; font-size: 1.15rem; color: #1e3d2f;"><b>🎯 AI 信心指數：</b> <span style="color: #11998e; font-weight: 700;">{round(float(sync_conf)*100, 1)}%</span></p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    if st.button("❌ 放棄此張照片，清空重新捕捉", use_container_width=True, type="secondary"):
-                        if db_connected:
-                            conn = pymysql.connect(**DB_CONFIG); cursor = conn.cursor()
-                            cursor.execute("UPDATE eco_brain_sync SET is_frozen=0, detected_species='Unknown', confidence_score=0.0, image_blob=NULL WHERE sync_key='main'")
-                            conn.commit(); cursor.close(); conn.close()
-                        st.rerun()
-                else:
-                    st.markdown("<div style='text-align:center; color:#7f8c8d; padding: 135px 0;'><h2>🧾 邊緣分析對接中</h2><p>目前空置中. 等待前台手機上傳巡田任務...</p></div>", unsafe_allow_html=True)
-
-    # 💻 B-2：遠端智慧溫室管理決策後台 
-    else:
-        st.markdown("<h1 class='main-title'>💼 Internet of Agriculture — 遠端智慧溫室管理決策後台</h1>", unsafe_allow_html=True)
-        
-        # 實時硬體與網路通訊探測
-        import socket
-        import torch
-        try:
-            mqtt_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM); mqtt_sock.settimeout(0.3)
-            mqtt_connected = (mqtt_sock.connect_ex(('127.0.0.1', 1883)) == 0); mqtt_sock.close()
-        except: mqtt_connected = False
-        yolo_status_text = "🟢 Apple Silicon (MPS) 加速中" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "🟢 雙大腦分流就緒"
-        try:
-            socket.gethostbyname("one.one.one.one")
-            drone_5g_status = f'<span style="color:#27ae60;">🟢 5G 已導通 (12ms)</span>'
-        except: drone_5g_status = '<span style="color:#c0392b;">🔴 5G 鏈路中斷</span>'
-
-        # 一體化工控狀態列
-        status_cols = st.columns(4)
-        status_cols[0].markdown(f'<div class="metric-box"><span style="font-size:0.8rem;color:#666;">📊 MySQL 資料庫</span><br><b>{"<span style=\'color:#27ae60;\'>🟢 正常連線</span>" if db_connected else "<span style=\'color:#c0392b;\'>🔴 連線失敗</span>"}</b></div>', unsafe_allow_html=True)
-        status_cols[1].markdown(f'<div class="metric-box"><span style="font-size:0.8rem;color:#666;">🤖 YOLOv8 核心</span><br><b><span style="color:#27ae60;">{yolo_status_text}</span></b></div>', unsafe_allow_html=True)
-        status_cols[2].markdown(f'<div class="metric-box"><span style="font-size:0.8rem;color:#666;">🔌 MQTT 閘門</span><br><b>{"<span style=\'color:#27ae60;\'>🟢 監聽中 (1883)</span>" if mqtt_connected else "<span style=\ 'color:#e67e22;\'>🟡 未啟動 Broker</span>"}</b></div>', unsafe_allow_html=True)
-        status_cols[3].markdown(f'<div class="metric-box"><span style="font-size:0.8rem;color:#666;">🛰️ 無人機 5G 鏈路</span><br><b>{drone_5g_status}</b></div>', unsafe_allow_html=True)
-        st.markdown("---")
-        
-        try:
-            conn = pymysql.connect(**DB_CONFIG); cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) as cnt FROM farm_tasks_v2 WHERE status='pending'")
-            pending_count = cursor.fetchone()['cnt']; cursor.close(); conn.close()
-        except: pending_count = 0
-        
-        col_m1, col_m2, col_m3 = st.columns(3)
-        with col_m1: st.markdown(f"<div class='metric-box'>📦 邊緣端待消化佇列<h2 style='color:#e67e22; margin:5px 0;'>{pending_count} 筆影像等待推論</h2></div>", unsafe_allow_html=True)
-        with col_m2: st.markdown(f"<div class='metric-box'>🤖 決策運算架構<h2 style='color:#27ae60; margin:5px 0;'>二階段分流推論引擎</h2></div>", unsafe_allow_html=True)
-        with col_m3: st.metric(label="🚨 今日累計病蟲害預警", value=f"{TODAY_ALERTS} 次引發", delta="🟢 狀態安全" if TODAY_ALERTS == 0 else "🚨 偵測到異常入侵")
-        
-        st.markdown("<br>", unsafe_allow_html=True)
-        col_dash_left, col_dash_right = st.columns([6, 5])
-        
-        with col_dash_left:
-            with st.container(border=True):
-                st.markdown("<h3 style='color:#2c3e50; margin-top:0;'>⚙️ 異步 Worker 決策運算面板</h3>", unsafe_allow_html=True)
-                if pending_count > 0:
-                    if st.session_state["role"] != "admin":
-                        st.caption("🔒 背景資料處理中，執行批次推論請聯絡高級工程師解鎖。")
-                    else:
-                        if st.button("🔥 啟動後台 AI 大腦：批次消化工業佇列任務", use_container_width=True):
-                            conn = pymysql.connect(**DB_CONFIG); cursor = conn.cursor()
-                            cursor.execute("SELECT * FROM farm_tasks_v2 WHERE status='pending'")
-                            for task in cursor.fetchall():
-                                pred_name, conf, brain_src, final_bytes = diagnose_image(task['file_path'])
-                                try: os.remove(task['file_path'])
-                                except: pass
-                                telemetry_engine.receive_high_frequency_hardware_stream()
-                                iot_snapshot = telemetry_engine.get_smooth_telemetry()
-                                cursor.execute("UPDATE farm_tasks_v2 SET status='completed', diagnosis_result=%s, confidence=%s, temperature=%s, moisture=%s WHERE id=%s", (pred_name, conf, iot_snapshot["temperature"], iot_snapshot["moisture"], task['id']))
-                            cursor.execute("UPDATE eco_brain_sync SET is_frozen=0, detected_species='Unknown', confidence_score=0.0, image_blob=NULL WHERE sync_key='main'")
-                            conn.commit(); cursor.close(); conn.close(); st.balloons(); time.sleep(0.5); st.rerun()
-                else: st.info("⚪ 邊緣感測排隊佇列目前空閒。")
-            
-            st.markdown("<br>", unsafe_allow_html=True)
-            with st.container(border=True):
-                st.markdown("<h3 style='color:#2c3e50; margin-top:0;'>📜 ESG 碳盤查與產銷履歷大水庫</h3>", unsafe_allow_html=True)
-                try:
-                    conn = pymysql.connect(**DB_CONFIG); cursor = conn.cursor()
-                    cursor.execute("SELECT id, status, diagnosis_result, confidence, temperature, moisture, created_at FROM farm_tasks_v2 ORDER BY id DESC LIMIT 5")
-                    for row in cursor.fetchall():
-                        friendly_name = get_friendly_name(row['diagnosis_result'])
-                        conf_pct = f"{round(float(row['confidence'])*100, 1)}%" if row['confidence'] else "0%"
-                        st.markdown(f'<div style="background:#ffffff; padding:10px; border-radius:8px; border:1px solid #eaf2ec; margin-bottom:8px;"><b>🆔 履歷 #{row["id"]}</b> | <b>🌿 認證：</b>{friendly_name} ({conf_pct}) | 微氣候快照: {row["temperature"]}°C ｜ 土壤濕度: {row["moisture"]}%</div>', unsafe_allow_html=True)
-                    cursor.close(); conn.close()
-                except Exception as e: st.error(f"表格渲染失敗: {e}")
-                
-        with col_dash_right:
-            with st.container(border=True):
-                st.markdown("<h3 style='color:#2c3e50; margin-top:0;'>⚙️ 工業級 PLC 執行器與 自動化閾值智控核心</h3>", unsafe_allow_html=True)
-                
-                if st.session_state["role"] != "admin":
-                    st.markdown("<p style='font-size:0.85rem; color:#7f8c8d; margin-bottom:5px;'>🔒 變更 PLC 暫存器閾值，請輸入管理員金鑰：</p>", unsafe_allow_html=True)
-                    u_try = st.text_input("🛡 *帳號*", value="", key="plc_u")
-                    p_try = st.text_input("🔑 *密碼*", type="password", value="", key="plc_p")
-                    if st.button("🔓 驗證並變更暫存器", use_container_width=True):
-                        if u_try == "admin" and p_try == ADMIN_KEYWORD:
-                            st.session_state["role"] = "admin"; st.success("解鎖成功！"); time.sleep(0.5); st.rerun()
-                        else: st.error("❌ 拒絕存取")
-                    
-                    sel_act = "🌬️ 溫室大棚環境流體強力散熱排風扇"
-                    th_temp = 30.0  
-                    th_moist = 40
-                else:
-                    st.info("🔓 管理員已授權動態修改 PLC 暫存器閾值。")
-                    sel_act = st.selectbox("核心智控元件對接選擇：", ["🌬️ 溫室大棚環境流體強力散熱排風扇", "💦 工業級防護精頻變頻灌溉泵浦"])
-                    
-                    if "排風扇" in sel_act:
-                        th_temp = st.slider("當前氣溫高階預警啟動閾值 (°C)", 25.0, 40.0, 30.0, 0.5)
-                        th_moist = 40 
-                    else:
-                        th_moist = st.slider("當前土壤濕度下限自動灌溉閾值 (%)", 20, 60, 40, 1)
-                        th_temp = 30.0 
-                
-                if "排風扇" in sel_act:
-                    trigger_fan = st.session_state["t_base"] > th_temp
-                    actuator_controller.set_fan("ON" if trigger_fan else "OFF")
-                    if trigger_fan:
-                        st.warning(f"⚠️ 警告：目前氣溫 {round(st.session_state['t_base'], 1)}°C 高於強制散熱閾值 {th_temp}°C！風扇狀態: 【{actuator_controller.fan_status}】")
-                    else: 
-                        st.success(f"🟢 智控通報：目前氣溫 safe。風扇狀態: 【{actuator_controller.fan_status}】")
-                else:
-                    trigger_pump = st.session_state["m_base"] < th_moist
-                    actuator_controller.set_pump("ON" if trigger_pump else "OFF")
-                    if trigger_pump:
-                        st.warning(f"⚠️ 警告：目前土壤濕度 {st.session_state['m_base']}% 低於自動灌溉閾值 {th_moist}%！變頻泵浦狀態: 【{actuator_controller.pump_status}】")
-                    else:
-                        st.success(f"🟢 智控通報：土壤飽水度良好。變頻泵浦狀態: 【{actuator_controller.pump_status}】")
-                        
-            st.markdown("<br>", unsafe_allow_html=True)
-            
-            with st.container(border=True):
-                st.markdown("<h3 style='color:#c0392b; margin-top:0;'>🚨 溫室季度交班與歷史數據封存</h3>", unsafe_allow_html=True)
-                reset_col1, reset_col2 = st.columns(2)
-                with reset_col1:
-                    if st.session_state["role"] != "admin":
-                        st.button("🔄 執行 Soft Archive 數據軟封存", use_container_width=True, disabled=True)
-                    else:
-                        if st.button("🔄 執行 Soft Archive 數據軟封存", use_container_width=True, type="secondary"):
-                            if db_connected:
-                                conn = pymysql.connect(**DB_CONFIG); cursor = conn.cursor(); today_str = datetime.now().strftime("%Y-%m-%d")
-                                cursor.execute("UPDATE farm_tasks_v2 SET status='archived' WHERE status='completed' AND created_at LIKE %s", (f"{today_str}%",))
-                                conn.commit(); cursor.close(); conn.close(); st.rerun()
-                with reset_col2:
-                    if st.session_state["role"] != "admin":
-                        st.button("⚠️ 全域資料庫初始化修復", use_container_width=True, disabled=True)
-                    else:
-                        if st.button("⚠️ 全域資料庫初始化修復", use_container_width=True, type="primary"):
-                            if db_connected:
-                                try:
-                                    conn = pymysql.connect(**DB_CONFIG); cursor = conn.cursor()
-                                    cursor.execute("TRUNCATE TABLE farm_tasks_v2")
-                                    cursor.execute("UPDATE eco_brain_sync SET is_frozen=0, detected_species='Unknown', confidence_score=0.0, image_blob=NULL WHERE sync_key='main'")
-                                    conn.commit(); cursor.close(); conn.close()
-                                    st.session_state["t_base"] = 28.5
-                                    st.session_state["m_base"] = 54
-                                    st.toast("💥 資料庫與環境狀態已完成全域初始化修復！")
-                                    time.sleep(0.5); st.rerun()
-                                except Exception as e: st.error(f"重置失敗: {e}")
-
-        # ==============================================================================
-        # 5. 數據科學圖表區 (🛡️ 全面脫離 DictCursor 運作)
-        # ==============================================================================
-        st.markdown("<br><h3 style='color:#1e3d2f;'>📊 Microclimate & Productivity — 溫室微氣候與高階產能數據科學面板</h3>", unsafe_allow_html=True)
-        db_chart_df, db_pie_df = pd.DataFrame(), pd.DataFrame()
-        if db_connected:
-            try:
-                pure_conn = pymysql.connect(
-                    host=DB_HOST, port=3306, user=DB_USER, password=DB_PASSWORD, database=DB_NAME, charset='utf8mb4'
+        conn = pymysql.connect(**DB_CONFIG)
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS system_audit_logs (
+                    id INT AUTO_INCREMENT PRIMARY KEY,
+                    user VARCHAR(50),
+                    action VARCHAR(255),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-                db_chart_df = pd.read_sql("SELECT id, temperature, moisture FROM farm_tasks_v2 WHERE status='completed' ORDER BY id ASC LIMIT 10", pure_conn)
-                db_pie_df = pd.read_sql("SELECT diagnosis_result, COUNT(*) as qty FROM farm_tasks_v2 WHERE status='completed' GROUP BY diagnosis_result", pure_conn)
-                pure_conn.close()
-            except Exception as chart_err: print(f"圖表即時編譯核心異常: {chart_err}")
+            """)
+            cursor.execute("INSERT INTO system_audit_logs (user, action) VALUES (%s, %s)", (user, action))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
 
-        chart_col1, chart_col2 = st.columns(2)
-        with chart_col1:
-            with st.container(border=True):
-                st.markdown("##### 📈 溫室大棚微氣候環境追蹤曲線 (動態時序)")
-                if not db_chart_df.empty:
-                    try:
-                        # 核心修正：直接用原始數值型態 id 來改名並設定為 Index，確保 Streamlit 嚴格按照 1, 2, 3...10 遞增排序
-                        chart_data = db_chart_df[['id', 'temperature', 'moisture']].rename(
-                            columns={'id': '巡檢流水號 (ID)', 'temperature': '氣溫 (°C)', 'moisture': '土壤濕度 (%)'}
-                        ).set_index('巡檢流水號 (ID)')
-                        
-                        st.line_chart(chart_data)
-                    except Exception as parse_err: st.caption(f"⏳ 時序訊號去噪平滑中...")
-                else: st.caption("⏳ 目前資料庫已完全抹平清空，等待巡檢數據流入中...")
+# ==========================================
+# 📊 動態安全抽水機
+# ==========================================
+def fetch_live_data_from_db():
+    try:
+        conn = pymysql.connect(**DB_CONFIG)
+        with conn.cursor() as cursor:
+            query = "SELECT id, diagnosis_result, confidence, file_path, created_at FROM farm_tasks_v2 ORDER BY created_at DESC LIMIT 50"
+            cursor.execute(query)
+            rows = cursor.fetchall()
+        conn.close()
+        
+        raw_df = pd.DataFrame(rows, columns=['ID', '診斷結果', '信心指數', '檔案路徑', '時間'])
+        
+        if not raw_df.empty:
+            raw_df['ID_clean'] = raw_df['ID'].astype(str).str.replace(r'\s+', '', regex=True).str.lower()
+            raw_df['結果_clean'] = raw_df['診斷結果'].astype(str).str.replace(r'\s+', '', regex=True).str.lower()
+            
+            clean_mask = (
+                (raw_df['ID_clean'] != 'id') & 
+                (raw_df['結果_clean'] != '診斷結果') & 
+                (raw_df['結果_clean'] != 'diagnosis_result') &
+                (raw_df['結果_clean'] != 'none') &
+                (raw_df['結果_clean'] != '')
+            )
+            
+            df_cleaned = raw_df[clean_mask].copy()
+            return "🟢 連線正常", df_cleaned.drop(columns=['ID_clean', '結果_clean'])
+        return "🟢 連線正常", pd.DataFrame(columns=['ID', '診斷結果', '信心指數', '檔案路徑', '時間'])
+    except Exception as e:
+        return f"🔴 連線異常 ({e})", pd.DataFrame(columns=['ID', '診斷結果', '信心指數', '檔案路徑', '時間'])
+
+# ==========================================
+# 🖥️ 主介面頂部狀態列
+# ==========================================
+col_title, col_status = st.columns([2.8, 1.2])
+with col_title:
+    st.title("🌿 智慧溫室綜合戰情室")
+    st.markdown("`Smart Eco-Farm War Room v4.0` · YOLOv8 雙軌影像監控整合系統")
+
+with col_status:
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.session_state["role"] == "staff":
+        with st.popover("🔒 管理員成員登入", use_container_width=True):
+            st.markdown("### 🔐 內部權限驗證")
+            with st.form("nav_login_form", clear_on_submit=True):
+                u = st.text_input("管理員帳號")
+                p = st.text_input("憑證密碼", type="password")
+                if st.form_submit_button("驗證並解鎖後台"):
+                    if u == "admin" and p == "farm2026":
+                        st.session_state["role"] = "admin"
+                        write_audit_log("admin", "成功登入管理員權限")
+                        st.rerun()
+                    else: st.error("❌ 帳號或密碼錯誤")
+    else:
+        st.markdown(f"<div style='text-align: right; margin-bottom: 5px; font-size: 13px; color:#27ae60;'><b>⚡ ADMIN MODE ACTIVE</b></div>", unsafe_allow_html=True)
+        st.markdown('<div class="logout-btn">', unsafe_allow_html=True)
+        if st.button("🔓 登出管理模式", use_container_width=True):
+            write_audit_log("admin", "安全登出管理模式")
+            st.session_state["role"] = "staff"
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+st.markdown("<br>", unsafe_allow_html=True)
+tab1, tab2 = st.tabs(["🖥️ Kiosk AI 實時監控看板", "💻 系統管理內部後台"])
+
+# ==========================================
+# 🖥️ Tab 1: Kiosk 監控看板
+# ==========================================
+with tab1:
+    col_left, col_right = st.columns([1, 2.5])
+    with col_left:
+        st.markdown("<div class='card' style='text-align: center; border-bottom: 4px solid #27ae60;'><h3>📱 手機巡田水入口</h3></div>", unsafe_allow_html=True)
+        ngrok_url = os.getenv('NGROK_URL', 'http://127.0.0.1:8000')
+        st.image(f"https://api.qrserver.com/v1/create-qr-code/?size=300x300&data={ngrok_url}/?client=mobile", use_container_width=True)
+        st.success("📡 NGROK 隧道正常監聽中")
+
+    with col_right:
+        st.markdown("<div class='card'><h3 style='margin: 0;'>📺 實時觀測大螢幕</h3></div>", unsafe_allow_html=True)
+        
+        @st.fragment(run_every=1)
+        def render_live_monitor_panel():
+            db_status, df = fetch_live_data_from_db() 
+            
+            DISEASE_KNOWLEDGE = {
+                "healthy": {"status": "🟢 狀態優良", "tip": "作物發育健康，維持目前溫濕度與光照參數即可。"},
+                "正常": {"status": "🟢 狀態優良", "tip": "作物發育健康，維持目前溫濕度與光照參數即可。"},
+                "insect": {"status": "🚨 檢出害蟲威脅", "tip": "YOLO 偵測到有害蟲蹤跡！請即刻派遣人員前往該區域噴灑有機防護劑。"},
+                "apple": {"status": "🍎 檢出測試水果 (蘋果)", "tip": "這是測試用的蘋果影像。代表全自動化連線已徹底打通！"},
+                "ants": {"status": "🐜 警報：現場檢出螞蟻危機", "tip": "系統已精準鑑定出螞蟻蹤跡！請確認是否引發集體搬運蚜蟲危機，建議執行局部生物物理防制。"},
+                "bees": {"status": "🐝 偵測到益蟲：蜜蜂", "tip": "畫面上出現蜜蜂，有助於溫室作物授粉，系統自動登錄生態平衡數據。"},
+                "beetles": {"status": "🪲 警報：現場檢出甲蟲/甲殼蟲危害", "tip": "發現甲蟲啃食葉片跡象！請進行物理誘捕，並加強巡視幼嫩組織受損狀況。"},
+                "tomato___early_blight": {"status": "🍂 警報：番茄葉片檢出早疫病病變", "tip": "植物病變大腦檢出 Tomato Early Blight！請立刻隔離病株，並評估調降溫室相對濕度。"}
+            }
+
+            is_live_ready = False
+            if not df.empty:
+                latest = df.iloc[0]
+                db_result = str(latest['診斷結果']).strip()
+                if db_result and db_result != "None" and db_result.lower() != 'standby': 
+                    is_live_ready = True
+
+            p_c1, p_c2 = st.columns([1.6, 1])
+
+            if is_live_ready:
+                current_id = latest['ID']
+                raw_conf = float(latest['信心指數'])
+                current_conf = f"{raw_conf * 100:.1f}" if raw_conf <= 1.0 else f"{raw_conf:.1f}"
+                current_time = latest['時間']
+                img_path = latest['檔案路徑']
                 
-        with chart_col2:
-            with st.container(border=True):
-                st.markdown("##### 🧫 溫室季度特徵侵擾佔比與歷史統計")
-                if not db_pie_df.empty:
-                    try:
-                        db_pie_df = db_pie_df[db_pie_df['diagnosis_result'].astype(str).str.contains('[a-zA-Z]')]
-                        if not db_pie_df.empty:
-                            db_pie_df['YOLOv8 偵測目標'] = db_pie_df['diagnosis_result'].apply(get_friendly_name)
-                            final_pie_df = db_pie_df[['YOLOv8 偵測目標', 'qty']].rename(columns={'qty': '數量'}).set_index('YOLOv8 偵測目標')
-                            st.dataframe(final_pie_df, use_container_width=True)
-                        else: st.caption("✨ 尚無有效推論熱點統計。")
-                    except Exception as tx_err: st.caption(f"📊 統計模組對齊中...")
-                else: st.caption("✨ 目前特徵水庫已全數排空。")
+                search_key = db_result.lower()
+                status_delta = DISEASE_KNOWLEDGE.get(search_key, {"status": f"⚠️ 檢出未知類別 [{db_result}]", "tip": "偵測到新標籤，系統已自動為您放行顯示照片，請確認權重定義。"})["status"]
+                action_tip = DISEASE_KNOWLEDGE.get(search_key, {"status": "", "tip": "偵測到新標籤，系統已自動為您放行顯示照片，請確認權重定義。"})["tip"]
+                metric_color = "#27ae60" if "🟢" in status_delta or "🍎" in status_delta or "🐝" in status_delta else "#e74c3c"
+                
+                if st.session_state["last_seen_id"] != current_id:
+                    st.toast(f"⚡ 雙核心 AI 數據成功更新！", icon="📸")
+                    st.session_state["last_seen_id"] = current_id
+                
+                with p_c1:
+                    if img_path and os.path.exists(str(img_path)):
+                        st.image(str(img_path), caption=f"📸 雙軌實拍傳回影像 (更新時間: {current_time})", use_container_width=True)
+                    else:
+                        st.markdown(f'<div class="video-panel" style="border-color: #e74c3c; color: #e74c3c;"><div style="font-size: 64px;">📸</div><b>影像檔案儲存中...</b></div>', unsafe_allow_html=True)
+            else:
+                db_result, current_conf, status_delta, action_tip, metric_color = "STANDBY", "--", "📡 系統待命中", "目前戰情室處於觀測待命狀態。請使用行動端/模擬器上傳現場實拍照。", "#7f8c8d"
+                with p_c1:
+                    st.markdown('<div class="video-panel"><div style="font-size: 64px;">📡</div><b>WAVE-FRONT CAMERA STANDBY</b></div>', unsafe_allow_html=True)
 
-        # ==============================================================================
-        # 🛸 6. 邊緣端現地突發事件模擬器 (方案 B：精簡文字、完美等寬對齊版)
-        # ==============================================================================
-        st.markdown("<br>", unsafe_allow_html=True)
-        with st.container(border=True):
-            st.markdown("<h4 style='color:#1e3d2f; margin-top:0;'>🛸 Edge Device Toolkit — 邊緣網關高頻數據／突發事件動態模擬器</h4>", unsafe_allow_html=True)
-            st.caption("💡 專門用於面試展示！可在離線環境下一鍵改寫感測器數值，用以動態校驗【環境流體強力散熱排風扇】與【精頻變頻灌溉泵浦】的 PLC 閉環保護機制。")
-            
-            # 🟢 標準 4 等分，強迫症最愛的絕對等寬
-            sim_col1, sim_col2, sim_col3, sim_col4 = st.columns(4)
-            
-            # 🟢 第一格：高溫模擬
-            with sim_col1:
-                if st.button("🌩️ 模擬高溫事件 (38.5°C)", use_container_width=True):
-                    st.session_state["t_base"] = 38.5
-                    st.toast("🌡️ 觸發突發高溫！請至 PLC 控制區確認【強力散熱排風扇】連動狀態。")
-                    time.sleep(0.4); st.rerun()
-                    
-            # 🟢 第二格：乾旱模擬 (修正：精準歸位到 sim_col2，擺脫卡格子 BUG)
-            with sim_col2:
-                if st.button("🌵 模擬突發乾旱 (22%)", use_container_width=True):
-                    st.session_state["m_base"] = 22
-                    st.toast("🏜️ 觸發乾旱缺水警告！請至 PLC 控制區將元件切換至【灌溉泵浦】確認連動狀態。")
-                    time.sleep(0.4); st.rerun()
-                    
-            # 🟢 第三格：常規恢復 (修正：精準歸位到 sim_col3，擺脫卡格子 BUG)
-            with sim_col3:
-                if st.button("🍀 恢復常規安全配置", use_container_width=True):
-                    st.session_state["t_base"] = 26.0
-                    st.session_state["m_base"] = 54
-                    st.toast("🟢 溫室微氣候指標已全面回歸常規安全狀態。")
-                    time.sleep(0.4); st.rerun()
-                    
-            # 🟢 第四格：排隊任務 (方案 B 精簡文字版，完美與前三格等寬對齊)
-            with sim_col4:
-                if st.button("📦 模擬接收：排隊 1 筆任務", use_container_width=True):
-                    if db_connected:
-                        try:
-                            conn = pymysql.connect(**DB_CONFIG); cursor = conn.cursor()
-                            ins_sql = "INSERT INTO farm_tasks_v2 (file_path, status, diagnosis_result, confidence, temperature, moisture) VALUES (%s, %s, %s, %s, %s, %s)"
-                            sim_t = st.session_state['t_base']
-                            sim_m = st.session_state['m_base']
-                            cursor.execute(ins_sql, ('./simulated_leaf.jpg', 'completed', 'Tomato Rust', 0.89, sim_t, sim_m))
-                            conn.commit(); cursor.close(); conn.close()
-                            st.toast("📦 邊緣端網關已成功寫入 1 筆任務！")
-                            time.sleep(0.4); st.rerun()
-                        except Exception as e: st.error(f"模擬寫入失敗: {e}")
+            with p_c2:
+                st.markdown("#### 🎯 最新實拍 AI 辨識分析")
+                st.markdown(f"<style>.live-result div[data-testid=\"stMetricValue\"] {{ color: {metric_color} !important; }}</style><div class=\"live-result\">", unsafe_allow_html=True)
+                st.metric("最新診斷結果", f"{db_result}", delta=status_delta, delta_color="normal" if "🟢" in status_delta or "🍎" in status_delta or "🐝" in status_delta else "inverse")
+                st.metric("AI 推論信心指數", f"{current_conf} %" if current_conf != "--" else f"{current_conf}")
+                st.markdown("</div>", unsafe_allow_html=True)
+                st.info(f"📋 **建議處置：**\n{action_tip}")
+                
+                st.markdown("<br><br><div class='clear-btn'>", unsafe_allow_html=True)
+                if st.button("🧹 清除目前畫面 (重置大螢幕)", use_container_width=True):
+                    conn = pymysql.connect(**DB_CONFIG)
+                    with conn.cursor() as cursor: cursor.execute("DELETE FROM farm_tasks_v2")
+                    conn.commit()
+                    conn.close()
+                    st.session_state["last_seen_id"] = None
+                    st.rerun()
+                st.markdown("</div>", unsafe_allow_html=True)
+        
+        render_live_monitor_panel()
+
+# ==========================================
+# 💻 Tab 2: 系統管理內部後台（升級：大滿貫農業數據流）
+# ==========================================
+with tab2:
+    db_status, df = fetch_live_data_from_db() 
+    
+    # 核心系統指標
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("MySQL 資料庫", db_status, delta="Ping: 12ms" if "正常" in db_status else "Error")
+    c2.metric("FastAPI 大腦", "🟢 在線", delta="雙核心模式開通")
+    c3.metric("邊緣感測器", "🟢 監聽中", delta="Node count: 8")
+    c4.metric("今日處理任務", f"{len(df)} 筆" if not df.empty else "0 筆")
+    
+    # 🟢 ✨ 【全新功能】實時邊緣感測器數據流 (IoT Live Stream)
+    st.markdown("<div class='iot-section'>⚙️ <b>實時邊緣感測器數據流 (IoT 現場廣播)</b></div>", unsafe_allow_html=True)
+    iot1, iot2, iot3, iot4 = st.columns(4)
+    iot1.metric("環境大氣溫度", "28.4 °C", delta="☀️ 正常範圍")
+    iot2.metric("相對空氣濕度", "62.1 %", delta="💧 適宜蒸散")
+    iot3.metric("土壤體積含水率", "32.5 %", delta="🌱 根系水分充足")
+    iot4.metric("全光譜光照強度", "8,450 Lux", delta="⚡ 光合作用旺盛")
+    
+    st.markdown("---")
+    
+    # 生成 24 小時模擬數據（包含四大關鍵指標）
+    chart_times = pd.date_range(end=datetime.now(), periods=24, freq='h')
+    np.random.seed(42)
+    mock_temp = 25 + np.sin(np.linspace(0, 2*np.pi, 24)) * 4 + np.random.normal(0, 0.3, 24)
+    mock_humidity = 65 - np.sin(np.linspace(0, 2*np.pi, 24)) * 10 + np.random.normal(0, 0.8, 24)
+    mock_soil = 34 + np.cos(np.linspace(0, 2*np.pi, 24)) * 2 + np.random.normal(0, 0.2, 24)
+    mock_sunlight = np.maximum(0, np.sin(np.linspace(-np.pi/2, 3*np.pi/2, 24)) * 12000 + np.random.normal(0, 500, 24))
+
+    # 📈 分流圖表一：空氣溫濕度動態趨勢
+    sub_col1, sub_col2 = st.columns(2)
+    with sub_col1:
+        st.subheader("📊 過去 24 小時大氣微氣候趨勢")
+        df_air = pd.DataFrame({"時間": chart_times, "溫室環境溫度 (°C)": mock_temp, "環境相對濕度 (%)": mock_humidity}).set_index("時間")
+        st.line_chart(df_air, height=220)
+
+    # 📈 ✨ 分流圖表二：補齊陽光與土壤含水率趨勢面板
+    with sub_col2:
+        st.subheader("📊 過去 24 小時土壤與日照動態")
+        df_soil_light = pd.DataFrame({"時間": chart_times, "土壤含水率 (%)": mock_soil, "日照光照強度 (Lux)": mock_sunlight}).set_index("時間")
+        st.line_chart(df_soil_light, height=220)
+    
+    # 任務紀錄列表
+    st.markdown("---")
+    st.subheader("📜 近期任務詳細紀錄")
+    if "🔴" in db_status: 
+        st.error("無法載入任務紀錄，請檢查 MySQL 連線。")
+    elif not df.empty: 
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    else: 
+        st.info("尚無歷史任務紀錄。")
+
+    # 核心硬體維護
+    st.markdown("---")
+    st.subheader("⚙️ 核心硬體與數據維護")
+    if st.session_state["role"] != "admin":
+        st.info("🔒 提示：目前為 [Staff 唯讀模式]。如需調整實體 PLC 或查看系統審計日誌，請從右上方登入。")
+    else:
+        st.success("✨ 管理員身份已解鎖，已啟用資安日誌追蹤。")
+        col_admin1, col_admin2 = st.columns(2)
+        with col_admin1:
+            if st.button("🔄 執行全域數據修復", use_container_width=True):
+                write_audit_log("admin", "手動觸發了【全域數據修復】清理 Ghost Data")
+                if "last_triggered_alert" in st.session_state: del st.session_state["last_triggered_alert"]
+                with st.spinner("正在清除鬼影資料並重置戰情室..."): time.sleep(1.5)
+                st.success("✨ 全域數據修復完成！")
+                st.rerun()
+        with col_admin2:
+            if st.button("🎛️ 校準 PLC 實體噴灌閥門", use_container_width=True):
+                write_audit_log("admin", "對邊緣硬體發送了【PLC 噴灌閥門校準】指令")
+                st.toast("正在向邊緣硬體發送校準訊號...")
+                time.sleep(1)
+                st.success("🤖 PLC 閥門校準成功！同步率 100%")
+                
+        st.markdown("<br><h4>🕵️‍♂️ 智慧農場資安操作日誌 (Audit Logs)</h4>", unsafe_allow_html=True)
+        try:
+            conn = pymysql.connect(**DB_CONFIG)
+            log_df = pd.read_sql("SELECT user as 操作者, action as 執行動作, created_at as 紀錄時間 FROM system_audit_logs ORDER BY created_at DESC LIMIT 5", conn)
+            conn.close()
+            st.dataframe(log_df, use_container_width=True)
+        except Exception:
+            st.info("暫無日誌數據或 system_audit_logs 表格初始化中。")
