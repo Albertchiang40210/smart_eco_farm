@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+streamlit
+pymysql
+mysql-connector-python
+ultralytics
+pandas
+python-dotenv

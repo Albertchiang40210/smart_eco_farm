@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  # 1. 智慧農場 MySQL 資料庫 (Port: 3311)
+  farm_db:
+    image: mysql:8.0
+    container_name: farm_mysql
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: P@ssw0rd           # 你的王牌密碼
+      MYSQL_DATABASE: smart_eco_farm_db       # 自動建立農場資料庫
+    ports:
+      - "3311:3306"                           # 外面對外 3311，內部 3306
+    volumes:
+      - farm_db_data:/var/lib/mysql
+
+  # 2. 農場 FastAPI 後端大腦 (Port: 8004)
+  farm_backend:
+    build: .
+    container_name: farm_api_service
+    restart: always
+    ports:
+      - "8004:8000"                           # 外部用 8004 連入
+    environment:
+      # 🟢 暴力流環境變數：不管是哪種寫法，通通強制指向隔壁的 farm_db 貨櫃！
+      - DB_HOST=farm_db
+      - MYSQL_HOST=farm_db
+      - DATABASE_HOST=farm_db
+      - DB_USER=root
+      - DB_PASSWORD=P@ssw0rd
+      - DB_NAME=smart_eco_farm_db
+    depends_on:
+      - farm_db
+
+  # 3. 農場 Streamlit 前端儀表板 (Port: 3003)
+  farm_frontend:
+    build: .
+    container_name: farm_web_service
+    restart: always
+    ports:
+      - "3003:8501"                           # 外部用 3003 連入網頁
+    environment:
+      - DB_HOST=farm_db
+      - MYSQL_HOST=farm_db
+      - DATABASE_HOST=farm_db
+      - DB_USER=root
+      - DB_PASSWORD=P@ssw0rd
+      - DB_NAME=smart_eco_farm_db
+    command: streamlit run farm_app.py --server.port=8501 --server.address=0.0.0.0
+    depends_on:
+      - farm_backend
+
+volumes:
+  farm_db_data:
