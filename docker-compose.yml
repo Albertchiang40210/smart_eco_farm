@@ -36,7 +36,7 @@ services:
   farm_frontend:
     build: .
     container_name: farm_web_service
-    restart: none
+    restart: "no"
     ports:
       - "3003:8501"                           # 外部用 3003 連入網頁
     environment:
