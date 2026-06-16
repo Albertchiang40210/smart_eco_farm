@@ -18,7 +18,7 @@ services:
   farm_backend:
     build: .
     container_name: farm_api_service
-    restart: always
+    restart: "no"
     ports:
       - "8004:8000"                           # 外部用 8004 連入
     environment:
