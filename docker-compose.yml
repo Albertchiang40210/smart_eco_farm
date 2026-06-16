@@ -5,7 +5,7 @@ services:
   farm_db:
     image: mysql:8.0
     container_name: farm_mysql
-    restart: always
+    restart: "no"
     environment:
       MYSQL_ROOT_PASSWORD: P@ssw0rd           # 你的王牌密碼
       MYSQL_DATABASE: smart_eco_farm_db       # 自動建立農場資料庫
