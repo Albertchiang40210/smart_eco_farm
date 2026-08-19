@@ -1,5 +1,8 @@
-insect_dataset/
 .venv/
+__pycache__/
+*.pyc
+.git/
 .DS_Store
+insect_dataset/
 result/
 *.jpg

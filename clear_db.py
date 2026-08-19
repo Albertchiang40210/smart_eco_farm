@@ -1,23 +1,29 @@
 import pymysql
+import os
+from dotenv import load_dotenv
+
+# 載入環境變數 (在 Docker 內會自動讀取 docker-compose 傳入的變數)
+load_dotenv()
 
 try:
-    # 建立與你網頁完全相同的實體連線
+    # 這裡直接套用跟你網頁一模一樣的連線邏輯！
     conn = pymysql.connect(
-        host="127.0.0.1",
-        port=3306,
-        user="root",
-        password="P@ssw0rd",
-        database="smart_eco_farm_db",
+        host=os.getenv("DB_HOST", "127.0.0.1"),  # 容器內會自動變成 'farm_db'
+        port=3306,                               # 容器內直通都是 3306
+        user=os.getenv("DB_USER", "root"),
+        password=os.getenv("DB_PASSWORD", "P@ssw0rd"),
+        database=os.getenv("DB_NAME", "smart_eco_farm_db"),
         charset="utf8mb4"
     )
     cursor = conn.cursor()
     
-    # 徹底摧毀並抹平整個表格，連 ID 計數器都會歸零
+    # 執行清洗指令
     cursor.execute("TRUNCATE TABLE farm_tasks_v2;")
     conn.commit()
     
-    print("\n🎯 【成功提示】實體 MySQL 資料庫已完美清洗抹平！舊資料徹底清除、計數器已歸零！\n")
+    print("\n✅【成功提示】(100% Docker 內執行) MySQL 資料庫已完美清洗抹平！\n")
     cursor.close()
     conn.close()
+
 except Exception as e:
     print(f"\n❌ 清洗失敗，原因: {e}\n")

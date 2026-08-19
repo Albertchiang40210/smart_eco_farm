@@ -1,15 +1,29 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from ultralytics import YOLO
 from PIL import Image, ImageOps  # 💡 引入 ImageOps 來處理重力感應標籤
 from dotenv import load_dotenv
 from datetime import datetime
-import pymysql
+import asyncio
 import io
 import os
+
+from sqlalchemy.orm import Session
+from database import SessionLocal, init_db, SensorLog, FarmTask, SystemAuditLog, EnvironmentRule
+from notifier import send_line_alert
+from loguru import logger
+import redis
+import json
+from auth import create_access_token, get_password_hash, verify_password, get_current_user
+
+redis_client = redis.Redis(host=os.getenv("REDIS_HOST", "localhost"), port=6379, db=0, decode_responses=True)
+
+# 設定 Loguru 日誌，自動切割
+logger.add("logs/system_{time}.log", rotation="12:00", retention="7 days", level="INFO")
 
 # 💡 引入 actuators.py 裡面的全域單例硬體控制器
 from actuators import actuator_controller 
@@ -20,14 +34,12 @@ load_dotenv()
 model_insect = None
 model_disease = None
 
-def get_db_connection():
-    return pymysql.connect(
-        host=os.getenv("DB_HOST", "127.0.0.1"),
-        user=os.getenv("DB_USER", "root"),
-        password=os.getenv("DB_PASSWORD", "P@ssw0rd"),
-        database=os.getenv("DB_NAME", "smart_eco_farm_db"),
-        charset="utf8mb4"
-    )
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 # 💡 定義從 sensors.py 傳過來的 IoT 資料格式
 class SensorPayload(BaseModel):
@@ -36,34 +48,39 @@ class SensorPayload(BaseModel):
     humidity: float
     soil_moisture: float
 
-# 💡 定義自動化的環境安全門檻（配合測試已放寬標準）
-TEMP_THRESHOLD = 28.0      # 氣溫高於 28°C 就開風扇
-HUMIDITY_THRESHOLD = 65.0  # 濕度低於 65% 就開水泵灑水
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global model_insect, model_disease
-    print("🔥 [系統啟動] 正在載入雙軌制 AI 專家大腦...")
+    logger.info("🔥 [系統啟動] 正在初始化資料庫與載入雙軌制 AI 專家大腦...")
+    init_db() # 啟動時初始化資料表
     
+    path_insect_onnx = "result/train/weights/best.onnx"
     path_insect = "result/train/weights/best.pt"
-    if os.path.exists(path_insect):
+    if os.path.exists(path_insect_onnx):
+        model_insect = YOLO(path_insect_onnx, task='detect')
+        logger.info("✅ [模型成功] 昆蟲 ONNX 加速大腦已就位！")
+    elif os.path.exists(path_insect):
         model_insect = YOLO(path_insect)
-        print("✅ [模型成功] 昆蟲物件偵測大腦已就位！")
+        logger.info("✅ [模型成功] 昆蟲物件偵測大腦已就位！")
     else:
-        print(f"⚠️ [模型缺失] 找不到昆蟲權重 {path_insect}")
+        logger.warning(f"⚠️ [模型缺失] 找不到昆蟲權重")
         model_insect = YOLO("yolov8s.pt")
 
+    path_disease_onnx = "result/runs/classify/train/weights/best.onnx"
     path_disease = "result/runs/classify/train/weights/best.pt"
-    if os.path.exists(path_disease):
+    if os.path.exists(path_disease_onnx):
+        model_disease = YOLO(path_disease_onnx, task='classify')
+        logger.info("✅ [模型成功] 植物病變 ONNX 加速大腦已就位！")
+    elif os.path.exists(path_disease):
         model_disease = YOLO(path_disease)
-        print("✅ [模型成功] 植物病變影像分類大腦已就位！")
+        logger.info("✅ [模型成功] 植物病變影像分類大腦已就位！")
     else:
-        print(f"⚠️ [模型缺失] 找不到植物病變權重 {path_disease}")
+        logger.warning(f"⚠️ [模型缺失] 找不到植物病變權重")
         model_disease = YOLO("yolov8s.pt")
         
     os.makedirs("result", exist_ok=True)
     yield
-    print("💤 [系統關閉] 釋放資源...")
+    logger.info("💤 [系統關閉] 釋放資源...")
 
 app = FastAPI(title="智慧生態農場雙軌 API", version="4.1", lifespan=lifespan)
 
@@ -112,7 +129,7 @@ def render_mobile_page():
                     const response = await fetch("/api/v1/detect_bugs", { method: "POST", body: formData });
                     const data = await response.json();
                     if (data.status === "success") {
-                        statusDiv.innerHTML = `✅ 鑑定完成：\${data.diagnosis} (\${Math.round(data.confidence * 100)}%)`;
+                        statusDiv.innerHTML = `✅ 鑑定完成：${data.diagnosis} (${Math.round(data.confidence * 100)}%)`;
                     }
                 } catch (error) {
                     statusDiv.innerHTML = "🚨 連線失敗，請檢查 NGROK";
@@ -123,10 +140,16 @@ def render_mobile_page():
     </html>
     """
 
+def run_yolo_inference(image):
+    # 此函式會在 ThreadPool 中執行，避免阻塞事件迴圈
+    res_insect = model_insect(image)
+    res_disease = model_disease(image)
+    return res_insect, res_disease
+
 @app.post("/api/v1/detect_bugs")
-def detect_bugs(file: UploadFile = File(...)):
+async def detect_bugs(file: UploadFile = File(...), db: Session = Depends(get_db)):
     try:
-        image_bytes = file.file.read()
+        image_bytes = await file.read()
         
         # 1. 開啟圖片並啟動「重力感應強制翻正雷達」
         raw_image = Image.open(io.BytesIO(image_bytes))
@@ -134,16 +157,15 @@ def detect_bugs(file: UploadFile = File(...)):
         
         # 2. 生成實體儲存路徑
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_location = f"result/mobile_{timestamp}.jpg"
+        file_location = os.path.join("result", f"mobile_{timestamp}.jpg")
         
-        # 3. 將翻正後的圖片儲存到本地（如果是 PNG 會自動轉 RGB 存 JPEG）
+        # 3. 將翻正後的圖片儲存到本地
         if image.mode in ("RGBA", "P"):
             image = image.convert("RGB")
         image.save(file_location, "JPEG", quality=90)
 
-        # 4. 雙腦同時平行開工！
-        res_insect = model_insect(image)   # 物件偵測
-        res_disease = model_disease(image) # 影像分類
+        # 4. 雙腦同時平行開工！ (改為非同步執行)
+        res_insect, res_disease = await asyncio.to_thread(run_yolo_inference, image)
         
         diagnosis = "Healthy"
         top_confidence = 0.0
@@ -154,10 +176,13 @@ def detect_bugs(file: UploadFile = File(...)):
             class_id = int(box.cls[0])
             diagnosis = model_insect.names[class_id]
             top_confidence = float(box.conf[0])
-            print(f"🐜 昆蟲偵測大腦勝出！圈出目標類別：{diagnosis} (信心度: {top_confidence:.2f})")
+            logger.info(f"🐜 昆蟲偵測大腦勝出！圈出目標類別：{diagnosis} (信心度: {top_confidence:.2f})")
             
             # ✨ 將帶有綠色方框的推論圖片存下來，覆蓋原本翻正後的圖片
             res_insect[0].save(filename=file_location)
+            
+            # 🔔 Line 通報
+            send_line_alert(f"⚠️ [警報] 溫室內發現異常目標：{diagnosis} (信心度: {top_confidence:.0%})", file_location)
             
         else:
             # 如果畫面上沒有發現 any 蟲子框框，轉交給植物病變分類大腦！
@@ -165,16 +190,21 @@ def detect_bugs(file: UploadFile = File(...)):
                 top1_idx = int(res_disease[0].probs.top1)
                 diagnosis = model_disease.names[top1_idx]
                 top_confidence = float(res_disease[0].probs.top1conf)
-                print(f"🍂 畫面上無昆蟲框框，轉交植物分類大腦！判定為：{diagnosis} (信心度: {top_confidence:.2f})")
+                logger.info(f"🍂 畫面上無昆蟲框框，轉交植物分類大腦！判定為：{diagnosis} (信心度: {top_confidence:.2f})")
+                
+                # 🔔 Line 通報 (若不是 Healthy)
+                if diagnosis.lower() not in ["healthy", "正常", "apple", "bees"]:
+                    send_line_alert(f"🍂 [警報] 偵測到植物病變：{diagnosis} (信心度: {top_confidence:.0%})", file_location)
 
-        # 寫入 MySQL
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        sql = "INSERT INTO farm_tasks_v2 (file_path, status, diagnosis_result, confidence) VALUES (%s, %s, %s, %s)"
-        cursor.execute(sql, (file_location, 'completed', diagnosis, top_confidence))
-        conn.commit()
-        cursor.close()
-        conn.close()
+        # 寫入 MySQL (透過 SQLAlchemy)
+        new_task = FarmTask(
+            file_path=file_location,
+            status='completed',
+            diagnosis_result=diagnosis,
+            confidence=top_confidence
+        )
+        db.add(new_task)
+        db.commit()
 
         return {"status": "success", "diagnosis": diagnosis, "confidence": round(top_confidence, 2)}
     except Exception as e:
@@ -182,17 +212,25 @@ def detect_bugs(file: UploadFile = File(...)):
 
 # 💡 核心整合功能：自動化環控並連動寫入網頁戰情室日誌
 @app.post("/api/v1/sensors")
-def receive_sensor_data(data: SensorPayload):
+def receive_sensor_data(data: SensorPayload, db: Session = Depends(get_db)):
     try:
-        print(f"📊 [接收數據] {data.device_id} -> 氣溫: {data.temperature}°C, 濕度: {data.humidity}%, 土壤: {data.soil_moisture}%")
+        logger.info(f"📊 [接收數據] {data.device_id} -> 氣溫: {data.temperature}°C, 濕度: {data.humidity}%, 土壤: {data.soil_moisture}%")
         
         log_messages = []
         db_actions = []
 
+        # 💡 動態載入智慧規則
+        rules = db.query(EnvironmentRule).all()
+        temp_high_rule = next((r for r in rules if r.sensor_type == 'temperature' and r.condition_operator == '>'), None)
+        hum_low_rule = next((r for r in rules if r.sensor_type == 'humidity' and r.condition_operator == '<'), None)
+        
+        temp_threshold = temp_high_rule.threshold_value if temp_high_rule else 28.0
+        hum_threshold = hum_low_rule.threshold_value if hum_low_rule else 65.0
+
         # 🌬️ 1. 氣溫環境監控邏輯 (排風扇控制)
-        if data.temperature > TEMP_THRESHOLD:
+        if data.temperature > temp_threshold:
             if actuator_controller.set_fan("ON"):
-                action_text = f"自動觸發：因氣溫過高 ({data.temperature}°C) 開啟排風扇降溫"
+                action_text = f"自動觸發：因氣溫過高 ({data.temperature}°C > {temp_threshold}) 開啟排風扇降溫"
                 log_messages.append(f"🔥 {action_text}")
                 db_actions.append(action_text)
         else:
@@ -203,9 +241,9 @@ def receive_sensor_data(data: SensorPayload):
                     db_actions.append(action_text)
 
         # 💦 2. 濕度環境監控邏輯 (灌溉水泵控制)
-        if data.humidity < HUMIDITY_THRESHOLD:
+        if data.humidity < hum_threshold:
             if actuator_controller.set_pump("ON"):
-                action_text = f"自動觸發：因環境濕度過低 ({data.humidity}%) 開啟變頻灌溉水泵"
+                action_text = f"自動觸發：因環境濕度過低 ({data.humidity}% < {hum_threshold}) 開啟變頻灌溉水泵"
                 log_messages.append(f"🚨 {action_text}")
                 db_actions.append(action_text)
         else:
@@ -215,29 +253,26 @@ def receive_sensor_data(data: SensorPayload):
                     log_messages.append(f"✅ {action_text}")
                     db_actions.append(action_text)
 
-        # 📝 3. 完美對接 farm_app.py 的 system_audit_logs 資料表
-        if db_actions:
-            try:
-                conn = get_db_connection()
-                with conn.cursor() as cursor:
-                    # 確保資料表存在（結構完全對接網頁端）
-                    cursor.execute("""
-                        CREATE TABLE IF NOT EXISTS system_audit_logs (
-                            id INT AUTO_INCREMENT PRIMARY KEY,
-                            user VARCHAR(50),
-                            action VARCHAR(255),
-                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )
-                    """)
-                    
-                    # 寫入自動化控制紀錄，操作者設定為 'system'
-                    for action in db_actions:
-                        cursor.execute("INSERT INTO system_audit_logs (user, action) VALUES (%s, %s)", ('system', action))
-                conn.commit()
-                conn.close()
-                print("📝 [資料庫同步成功] 邊緣硬體控制事件已寫入 system_audit_logs")
-            except Exception as db_err:
-                print(f"⚠️ [資料庫寫入失敗] 原因: {db_err}")
+        # 寫入真實 Sensor 數據到資料庫
+        new_sensor_log = SensorLog(
+            device_id=data.device_id,
+            temperature=data.temperature,
+            humidity=data.humidity,
+            soil_moisture=data.soil_moisture,
+            lux=getattr(data, 'lux', 0.0) # 如果 payload 有 lux
+        )
+        db.add(new_sensor_log)
+
+        # 寫入系統日誌
+        for action in db_actions:
+            new_audit = SystemAuditLog(user='system', action=action)
+            db.add(new_audit)
+            
+            # 🔔 異常動作 Line 通報
+            if "開啟" in action:
+                send_line_alert(f"⚙️ [自動控制觸發] {action}")
+            
+        db.commit()
 
         # 4. 組裝回傳封包給 sensors.py 端顯示
         alert_info = " | ".join(log_messages) if log_messages else "環境數據穩定，硬體設備維持現狀。"
@@ -249,3 +284,46 @@ def receive_sensor_data(data: SensorPayload):
         
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+# ==========================================
+# 5. 企業級 JWT 登入與儀表板 API
+# ==========================================
+fake_users_db = {
+    "admin": {
+        "username": "admin",
+        "hashed_password": get_password_hash("secret"),
+    }
+}
+
+@app.post("/api/v1/login")
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    user_dict = fake_users_db.get(form_data.username)
+    if not user_dict or not verify_password(form_data.password, user_dict["hashed_password"]):
+        raise HTTPException(status_code=400, detail="帳號或密碼錯誤")
+    
+    access_token = create_access_token(data={"sub": form_data.username})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/api/v1/sensors/history")
+def get_sensor_history(db: Session = Depends(get_db), current_user: str = Depends(get_current_user)):
+    try:
+        cached = redis_client.get("sensor_history")
+        if cached:
+            return json.loads(cached)
+    except Exception as e:
+        logger.warning(f"Redis connection failed: {e}")
+        
+    logs = db.query(SensorLog).order_by(SensorLog.created_at.desc()).limit(24).all()
+    result = [{"temperature": l.temperature, "humidity": l.humidity, "soil_moisture": l.soil_moisture, "created_at": l.created_at.isoformat()} for l in logs]
+    
+    try:
+        redis_client.setex("sensor_history", 10, json.dumps(result))
+    except:
+        pass
+        
+    return result
+
+@app.get("/api/v1/tasks/history")
+def get_task_history(db: Session = Depends(get_db), current_user: str = Depends(get_current_user)):
+    tasks = db.query(FarmTask).order_by(FarmTask.created_at.desc()).limit(20).all()
+    return tasks

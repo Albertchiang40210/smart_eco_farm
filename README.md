@@ -3,64 +3,89 @@
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
 [![YOLOv8](https://img.shields.io/badge/AI-YOLOv8%20%2F%20Computer%20Vision-green)](https://github.com/ultralytics/ultralytics)
 [![MySQL](https://img.shields.io/badge/Database-MySQL-orange)](https://www.mysql.com/)
+[![React](https://img.shields.io/badge/React-Vite-blue)](https://react.dev/)
+[![Docker](https://img.shields.io/badge/Docker-Compose-blue)](https://www.docker.com/)
 
-這是一個結合了 **電腦視覺（Computer Vision）與關聯式資料庫（MySQL）** 的 **智慧農業 / 生態農場自動化管理系統**。系統旨在解決傳統農業高度依賴人工巡檢、環境數據無法留存的痛點。透過 AI 進行作物健康度/病蟲害追蹤，並將即時環境數據與辨識日誌寫入 MySQL 資料庫，打造數據驅動的現代化新農業解決方案。
+這是一個結合了 **電腦視覺（Computer Vision）、關聯式資料庫（MySQL）、現代化前端 (React) 與微服務容器 (Docker)** 的 **企業級智慧農業自動化管理系統**。系統旨在解決傳統農業高度依賴人工巡檢的痛點，透過 Edge AI 進行作物病蟲害追蹤，並將即時環境數據寫入資料庫，打造數據驅動的現代化新農業解決方案。
 
 ---
 
-## 🚀 核心技術亮點 (Key Features)
+## 🚀 核心技術亮點 (Enterprise Features)
 
-- **農作物與病蟲害物件偵測 (Agri-CV Core):** 利用 YOLOv8 進行客製化目標偵測，能即時辨識不同作物的成熟度（如：未成熟、可採收），並精準捕捉早期病蟲害特徵。
-- **時序數據與資料庫工程 (Database Engineering):** 獨立設計關聯式資料庫（MySQL），包含 `環境日誌表 (Sensor Logs)`、`AI 辨識警報表 (AI Detection Alerts)`。確保高頻率數據寫入時的穩定性。
-- **異常事件觸發機制 (Event-Driven Alerts):** 當 AI 偵測到有害生物或環境數據（如溫度、濕度）超越安全門檻時，資料庫會自動觸發狀態更新，作為後端即時推播（如 Line Bot/Email 警報）的數據中樞。
+本系統經歷了深度架構升級，具備商業級的穩定度與效能：
+
+- **Edge AI 推論加速 (ONNX):** 利用 YOLOv8 偵測病蟲害，並提供轉檔腳本 (`export_onnx.py`) 匯出為 ONNX 格式，使用 ONNXRuntime 大幅加速推論效率，完美支援邊緣裝置部署。
+- **動態智慧規則引擎 (Dynamic Rules):** 捨棄寫死的環境門檻，支援動態讀取資料庫的感測器閥值 (如：溫度、濕度)，自動觸發排風扇、灌溉水泵等硬體設備，極具彈性。
+- **高併發與資料庫工程 (Redis + SQLAlchemy):** 使用 SQLAlchemy ORM 管理資料表，並導入 **Redis** 記憶體資料庫作為歷史數據快取，有效減輕 MySQL 壓力，足以應付萬級 IoT 感測器寫入。
+- **企業級資安防護 (JWT + Bcrypt):** 導入 OAuth2 JWT 憑證授權機制，鎖死 API，防禦未授權存取。
+- **現代化戰情室 (React PWA):** 徹底前後端分離，透過 Vite + React + Tailwind CSS 打造了全新的現代化環境監控儀表板。
+- **全自動維運 (DevOps & Logging):** 導入 `Loguru` 結構化日誌記錄，內建 `Pytest` 單元測試，並配置 GitHub Actions 進行 CI/CD 流水線檢查。提供每日自動清理腳本 (`cleanup.py`) 防止硬碟爆滿。
 
 ---
 
 ## 📐 系統架構圖 (System Architecture)
-[ 農場實體攝影機 ] ──────> [ YOLOv8 病蟲害 / 成熟度偵測 ] ──┐
-▼
-[ 環境感測器 (溫濕度) ] ──> [ 數據流處理 (Python Core) ] ───> [ MySQL 中央資料庫 ]
-│
-▼
-[ 歷史數據分析 / 採收預警 ]
+```mermaid
+graph TD;
+    A[農場實體攝影機 & 感測器] -->|IoT 數據 / 影像| B(FastAPI 後端大腦)
+    B -->|YOLOv8 / ONNX| C{病蟲害與成熟度分析}
+    B -->|溫濕度自動規則| D[自動控制器 Actuators]
+    B -->|Redis 快取| E[(Redis Cache)]
+    B -->|SQLAlchemy| F[(MySQL 中央資料庫)]
+    B -->|JWT 驗證| G[React 前端戰情室]
+    C -->|異常事件警報| H[Line Notify 推播]
+```
 
 ---
 
 ## 📂 專案目錄結構 (Project Structure)
 
+```text
 SMART_ECO_FARM/
-├── .env                  # 資料庫連線金鑰與密碼管理
-├── data.yaml             # YOLO 訓練集配置 (病蟲害種類、作物類別)
-├── train.py              # 農場專用 AI 模型訓練與超參數調校腳本
-├── test_predict.py       # 本地端即時影像/串流辨識腳本
-├── db_manager.py         # MySQL 資料庫模組 (處理 Sensor 資料寫入與歷史紀錄查詢)
-├── sensor_simulator.py   # 模擬農場 IoT 感測器 (土壤溫度、濕度、光照) 數據生成腳本
-├── result/               # 儲存最佳訓練權重 `best.pt` 與分析圖表
-└── data/                 # 農場影像資料集 (作物、葉片病變、昆蟲標籤)
+├── .github/workflows/    # CI/CD 自動化測試腳本
+├── frontend/             # React + Vite 現代化前端戰情室
+├── logs/                 # Loguru 結構化日誌存放區
+├── database.py           # SQLAlchemy ORM 結構與資料庫連線
+├── main.py               # FastAPI 核心大腦路由與推論邏輯
+├── auth.py               # JWT 驗證與加密核心
+├── notifier.py           # Line Notify 自動推播模組
+├── cleanup.py            # 過期影像與資料庫紀錄清理排程
+├── export_onnx.py        # YOLO 模型轉 ONNX 腳本
+├── test_main.py          # PyTest 測試腳本
+├── docker-compose.yml    # 微服務環境一鍵啟動配置
+└── .env                  # 資料庫連線、金鑰與 LINE Token 管理
+```
 
-🐛 支援辨識與監控項目 (Monitoring Classes)
-本系統目前針對以下農業核心指標進行監控：
-	1.	作物成熟度分級: Unripe (未成熟) | Ripe (可採收)
-	2.	植物病理與蟲害偵測: Leaf_Rust (葉鏽病) | Powdery_Mildew (白粉病) | Pests (害蟲/如蚜蟲、紅蜘蛛)
-	3.	IoT 環境指標: 土壤水分 (Soil Moisture) | 空氣溫濕度 (Ambient Temp/Humidity) | 光照強度 (Lux)
-🛠️ 快速開始 (Getting Started)
-1. 環境安裝
-pip install ultralytics pymysql pandas opencv-python
+---
 
-2. 資料庫初始化
-請在 MySQL 中建立 smart_farm 資料庫，並執行對應的 SQL 語法建立 sensor_logs 與 ai_alerts 資料表。接著於 .env 配置連線：
-DB_HOST=localhost
-DB_USER=your_username
-DB_PASSWORD=your_password
-DB_NAME=smart_farm
+## 🛠️ 快速開始 (Getting Started)
 
-3. 啟動模擬環境與辨識
-# 執行環境感測數據定時寫入 MySQL
-python sensor_simulator.py
+本系統支援 **Docker 一鍵部署**，強烈建議使用 Docker 啟動，避免環境衝突。
 
-# 執行即時影像病蟲害偵測
-python test_predict.py
+1. **環境配置:**
+   請在根目錄修改 `.env` 檔案（填寫 `LINE_NOTIFY_TOKEN` 以啟用警報）。
 
-📈 未來優化方向 (Future Roadmap)
-	1.	多感測器時間序列預報: 引入機器學習迴歸模型（如 XGBoost），利用 MySQL 內的歷史溫濕度日誌，預測未來 3 天的土壤乾燥趨勢，達到自動化精準灌溉。
-	2.	邊緣設備部署 (Edge AI): 將 YOLOv8 模型量化並部署至樹莓派 (Raspberry Pi) 或 Jetson Nano，實現真正的溫室在地端離線辨識。
+2. **一鍵啟動所有微服務:**
+   ```bash
+   docker-compose up --build -d
+   ```
+   系統將同時啟動：
+   * `farm_mysql`: MySQL 資料庫 (Port: 3308)
+   * `farm_redis`: Redis 快取 (Port: 6379)
+   * `farm_backend`: FastAPI 後端大腦 (Port: 8001)
+   * `react_web_service`: React 前端戰情室 (Port: 3000)
+
+3. **瀏覽戰情室:**
+   打開瀏覽器訪問 `http://localhost:3000`
+
+---
+
+## 📈 DevOps 與自動化測試
+若您希望在本地開發並測試：
+```bash
+# 安裝依賴
+pip install -r requirements.txt
+
+# 執行自動化測試
+pytest test_main.py
+```
+本專案已整合 GitHub Actions，推送程式碼將自動觸發 `main.yml` 檢查。
