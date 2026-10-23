@@ -1,26 +1,16 @@
-import os
 from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from datetime import datetime
-from dotenv import load_dotenv
 
-load_dotenv()
+from settings import DATABASE_URL
 
-DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
-DB_USER = os.getenv("DB_USER", "root")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "P@ssw0rd")
-DB_NAME = os.getenv("DB_NAME", "smart_eco_farm_db")
+_engine_kwargs = {"pool_recycle": 3600, "pool_pre_ping": True}
+if DATABASE_URL.startswith("sqlite"):
+    _engine_kwargs["connect_args"] = {"check_same_thread": False}
+else:
+    _engine_kwargs.update(pool_size=10, max_overflow=20)
 
-# Use pymysql driver
-DATABASE_URL = f"mysql+pymysql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:3306/{DB_NAME}?charset=utf8mb4"
-
-# Create Engine with connection pool
-engine = create_engine(
-    DATABASE_URL,
-    pool_size=10,        # Pool size
-    max_overflow=20,     # Max extra connections
-    pool_recycle=3600,   # Recycle connections every hour
-)
+engine = create_engine(DATABASE_URL, **_engine_kwargs)
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -34,7 +24,7 @@ class SensorLog(Base):
     humidity = Column(Float)
     soil_moisture = Column(Float)
     lux = Column(Float, default=0.0)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 class FarmTask(Base):
     __tablename__ = "farm_tasks_v2"

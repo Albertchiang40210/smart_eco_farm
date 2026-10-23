@@ -1,51 +1,66 @@
+# 使用前：cp .env.example .env 並填入所有 change_me 的值
 services:
-  # 1. 智慧農場 MySQL 資料庫 (Port: 3308)
   farm_db:
     image: mysql:8.0
     container_name: farm_mysql
-    restart: "no"
+    restart: unless-stopped
     environment:
-      MYSQL_ROOT_PASSWORD: P@ssw0rd           
-      MYSQL_DATABASE: smart_eco_farm_db       
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:?請在 .env 設定 DB_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME:-smart_eco_farm_db}
     ports:
-      - "3308:3306"                           
+      - "127.0.0.1:3308:3306"
+    volumes:
       - farm_db_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
 
-  # 1.5. 高併發快取 (Redis)
   farm_redis:
     image: redis:7-alpine
     container_name: farm_redis
-    restart: "no"
-    ports:
-      - "6379:6379"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
 
-  # 2. 農場 FastAPI 後端大腦 (Port: 8001)
   farm_backend:
     build: .
     container_name: farm_api_service
-    restart: "no"
+    restart: unless-stopped
     ports:
-      - "8001:8000"                           
+      - "8001:8000"
     environment:
-      - DB_HOST=farm_db
-      - MYSQL_HOST=farm_db
-      - DATABASE_HOST=farm_db
-      - DB_USER=root
-      - DB_PASSWORD=P@ssw0rd
-      - DB_NAME=smart_eco_farm_db
-      - REDIS_HOST=farm_redis
+      DB_HOST: farm_db
+      DB_USER: root
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME:-smart_eco_farm_db}
+      REDIS_HOST: farm_redis
+      SECRET_KEY: ${SECRET_KEY:?請在 .env 設定 SECRET_KEY}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?請在 .env 設定 ADMIN_PASSWORD}
+      DEVICE_API_KEY: ${DEVICE_API_KEY:?請在 .env 設定 DEVICE_API_KEY}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
     volumes:
-      # 🟢 大腦產出的圖片，透過這個管道同步回 Mac 本機的 ./result
-      - ./result:/app/result
-      - ./phone_upload_queue:/app/phone_upload_queue
+      - ./result:/app/result      # 訓練好的權重與推論結果圖
+      - ./logs:/app/logs
     depends_on:
-      - farm_db
+      farm_db:
+        condition: service_healthy
+      farm_redis:
+        condition: service_healthy
 
-  # 3. 農場 React 現代化前端 (Port: 3000)
   react_frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8001}
     container_name: react_web_service
-    restart: "no"
+    restart: unless-stopped
     ports:
       - "3000:3000"
     depends_on:

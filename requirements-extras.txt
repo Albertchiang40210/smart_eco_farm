@@ -1,0 +1,4 @@
+# 選用：舊版 Streamlit 儀表板（farm_app.py）與訓練腳本
+streamlit
+pandas
+opencv-python-headless

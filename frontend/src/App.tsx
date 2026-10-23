@@ -1,74 +1,100 @@
-import { useState, useEffect } from 'react'
+import { useCallback, useEffect, useState } from 'react'
+import {
+  fetchSensors, fetchTasks, getToken, logout, UnauthorizedError,
+  type DetectionTask, type SensorReading,
+} from './api'
+import Login from './Login'
 
-function App() {
-  const [sensors, setSensors] = useState<any[]>([])
-  const [tasks, setTasks] = useState<any[]>([])
+const REFRESH_MS = 10_000
+
+function Stat({ label, value, unit }: { label: string; value?: number; unit: string }) {
+  return (
+    <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
+      <h3 className="text-slate-400 text-sm font-bold tracking-wider mb-2">{label}</h3>
+      <p className="text-3xl font-bold text-slate-800">{value ?? '--'}{value !== undefined && unit}</p>
+    </div>
+  )
+}
+
+function Dashboard({ onLogout }: { onLogout: () => void }) {
+  const [sensors, setSensors] = useState<SensorReading[]>([])
+  const [tasks, setTasks] = useState<DetectionTask[]>([])
+  const [error, setError] = useState('')
+
+  const load = useCallback(async () => {
+    try {
+      const [s, t] = await Promise.all([fetchSensors(), fetchTasks()])
+      setSensors(s)
+      setTasks(t)
+      setError('')
+    } catch (err) {
+      if (err instanceof UnauthorizedError) onLogout()
+      else setError('無法連線到後端，稍後自動重試')
+    }
+  }, [onLogout])
 
   useEffect(() => {
-    fetch('http://localhost:8001/api/v1/sensors/history')
-      .then(res => res.json())
-      .then(data => setSensors(data))
+    load()
+    const timer = setInterval(load, REFRESH_MS)
+    return () => clearInterval(timer)
+  }, [load])
 
-    fetch('http://localhost:8001/api/v1/tasks/history')
-      .then(res => res.json())
-      .then(data => setTasks(data))
-  }, [])
+  const latest = sensors[0]
 
   return (
     <div className="min-h-screen bg-slate-50 p-8 font-sans text-slate-800">
       <header className="mb-8 flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-extrabold text-emerald-700">🌿 Smart Eco-Farm</h1>
-          <p className="text-slate-500">React Dashboard Edge Node</p>
+          <p className="text-slate-500">
+            {latest ? `最後更新 ${new Date(latest.created_at + 'Z').toLocaleTimeString()}` : '尚無感測資料'}
+          </p>
         </div>
+        <button onClick={() => { logout(); onLogout() }} className="text-sm text-slate-500 hover:text-slate-800">登出</button>
       </header>
 
+      {error && <div className="mb-6 p-3 rounded-lg bg-amber-50 text-amber-800 text-sm">{error}</div>}
+
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
-          <h3 className="text-slate-400 text-sm font-bold tracking-wider mb-2">TEMP</h3>
-          <p className="text-3xl font-bold text-slate-800">{sensors[0]?.temperature || '--'}°C</p>
-        </div>
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
-          <h3 className="text-slate-400 text-sm font-bold tracking-wider mb-2">HUMIDITY</h3>
-          <p className="text-3xl font-bold text-slate-800">{sensors[0]?.humidity || '--'}%</p>
-        </div>
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
-          <h3 className="text-slate-400 text-sm font-bold tracking-wider mb-2">SOIL</h3>
-          <p className="text-3xl font-bold text-slate-800">{sensors[0]?.soil_moisture || '--'}%</p>
-        </div>
-        <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
-          <h3 className="text-slate-400 text-sm font-bold tracking-wider mb-2">LUX</h3>
-          <p className="text-3xl font-bold text-slate-800">{sensors[0]?.lux || '--'}</p>
-        </div>
+        <Stat label="TEMP" value={latest?.temperature} unit="°C" />
+        <Stat label="HUMIDITY" value={latest?.humidity} unit="%" />
+        <Stat label="SOIL" value={latest?.soil_moisture} unit="%" />
+        <Stat label="LUX" value={latest?.lux} unit=" lx" />
       </div>
 
-      <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100 mb-8">
+      <div className="bg-white p-6 rounded-2xl shadow-sm border border-slate-100">
         <h2 className="text-xl font-bold mb-4">Latest AI Detections</h2>
-        <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse">
-            <thead>
-              <tr className="border-b border-slate-100 text-slate-400">
-                <th className="py-3 px-4 font-semibold text-sm">Status</th>
-                <th className="py-3 px-4 font-semibold text-sm">Diagnosis</th>
-                <th className="py-3 px-4 font-semibold text-sm">Confidence</th>
-              </tr>
-            </thead>
-            <tbody>
-              {tasks.map(t => (
-                <tr key={t.id} className="border-b border-slate-50 hover:bg-slate-50 transition-colors">
-                  <td className="py-3 px-4">
-                    <span className="bg-emerald-100 text-emerald-700 px-3 py-1 rounded-full text-xs font-bold">{t.status}</span>
-                  </td>
-                  <td className="py-3 px-4 font-medium">{t.diagnosis_result}</td>
-                  <td className="py-3 px-4">{(t.confidence * 100).toFixed(1)}%</td>
+        {tasks.length === 0 ? (
+          <p className="text-slate-400 text-sm">尚無偵測紀錄</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse">
+              <thead>
+                <tr className="border-b border-slate-100 text-slate-400 text-sm">
+                  <th className="py-3 px-4 font-semibold">Time</th>
+                  <th className="py-3 px-4 font-semibold">Diagnosis</th>
+                  <th className="py-3 px-4 font-semibold">Confidence</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {tasks.map(t => (
+                  <tr key={t.id} className="border-b border-slate-50 hover:bg-slate-50 transition-colors">
+                    <td className="py-3 px-4 text-sm text-slate-500">{new Date(t.created_at + 'Z').toLocaleString()}</td>
+                    <td className="py-3 px-4 font-medium">{t.diagnosis_result}</td>
+                    <td className="py-3 px-4">{(t.confidence * 100).toFixed(1)}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
     </div>
   )
 }
 
-export default App
+export default function App() {
+  const [authed, setAuthed] = useState(() => !!getToken())
+  const handleLogout = useCallback(() => setAuthed(false), [])
+  return authed ? <Dashboard onLogout={handleLogout} /> : <Login onSuccess={() => setAuthed(true)} />
+}

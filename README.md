@@ -1,91 +1,130 @@
-# 🌾 AI-Powered Smart Eco-Farm & Environmental Monitoring System
+# 🌾 Smart Eco-Farm — 智慧溫室監控與病蟲害偵測系統
 
-[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![YOLOv8](https://img.shields.io/badge/AI-YOLOv8%20%2F%20Computer%20Vision-green)](https://github.com/ultralytics/ultralytics)
-[![MySQL](https://img.shields.io/badge/Database-MySQL-orange)](https://www.mysql.com/)
-[![React](https://img.shields.io/badge/React-Vite-blue)](https://react.dev/)
-[![Docker](https://img.shields.io/badge/Docker-Compose-blue)](https://www.docker.com/)
+[![CI](https://github.com/Albertchiang40210/smart_eco_farm/actions/workflows/main.yml/badge.svg)](https://github.com/Albertchiang40210/smart_eco_farm/actions)
+![Python](https://img.shields.io/badge/Python-3.10+-blue)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688)
+![YOLOv8](https://img.shields.io/badge/YOLOv8-ONNX-green)
+![React](https://img.shields.io/badge/React-19-61dafb)
+![Docker](https://img.shields.io/badge/Docker-Compose-2496ed)
 
-這是一個結合了 **電腦視覺（Computer Vision）、關聯式資料庫（MySQL）、現代化前端 (React) 與微服務容器 (Docker)** 的 **企業級智慧農業自動化管理系統**。系統旨在解決傳統農業高度依賴人工巡檢的痛點，透過 Edge AI 進行作物病蟲害追蹤，並將即時環境數據寫入資料庫，打造數據驅動的現代化新農業解決方案。
+一個端到端的 IoT + 電腦視覺專案：感測器上報溫濕度 → 後端依資料庫規則自動控制風扇／水泵；現場以手機拍照 → 雙模型（昆蟲偵測 + 葉片病變分類）診斷 → Telegram 警報；React 儀表板即時檢視。
 
----
+> 這是個人作品集專案。硬體（風扇、水泵、感測器）以軟體模擬，其餘軟體鏈路皆可實際運行。
 
-## 🚀 核心技術亮點 (Enterprise Features)
+<!-- TODO: 在此放儀表板與手機巡檢端截圖，例如 docs/dashboard.png -->
 
-本系統經歷了深度架構升級，具備商業級的穩定度與效能：
+## 功能
 
-- **Edge AI 推論加速 (ONNX):** 利用 YOLOv8 偵測病蟲害，並提供轉檔腳本 (`export_onnx.py`) 匯出為 ONNX 格式，使用 ONNXRuntime 大幅加速推論效率，完美支援邊緣裝置部署。
-- **動態智慧規則引擎 (Dynamic Rules):** 捨棄寫死的環境門檻，支援動態讀取資料庫的感測器閥值 (如：溫度、濕度)，自動觸發排風扇、灌溉水泵等硬體設備，極具彈性。
-- **高併發與資料庫工程 (Redis + SQLAlchemy):** 使用 SQLAlchemy ORM 管理資料表，並導入 **Redis** 記憶體資料庫作為歷史數據快取，有效減輕 MySQL 壓力，足以應付萬級 IoT 感測器寫入。
-- **企業級資安防護 (JWT + Bcrypt):** 導入 OAuth2 JWT 憑證授權機制，鎖死 API，防禦未授權存取。
-- **現代化戰情室 (React PWA):** 徹底前後端分離，透過 Vite + React + Tailwind CSS 打造了全新的現代化環境監控儀表板。
-- **全自動維運 (DevOps & Logging):** 導入 `Loguru` 結構化日誌記錄，內建 `Pytest` 單元測試，並配置 GitHub Actions 進行 CI/CD 流水線檢查。提供每日自動清理腳本 (`cleanup.py`) 防止硬碟爆滿。
+| 模組 | 說明 |
+|---|---|
+| **雙模型影像診斷** | YOLOv8s 偵測 12 類昆蟲；偵測不到時改交 YOLOv8 分類模型判斷葉片病變。支援載入 ONNX 權重（`export_onnx.py` 匯出）。推論在 thread pool 執行，不阻塞事件迴圈。 |
+| **規則引擎** | 規則存在 MySQL `environment_rules`（感測類型、運算子 `> < >= <=`、閾值、目標設備），感測資料進來時逐條評估。改規則不需重啟或改程式。 |
+| **執行器抽象層** | `actuators.py` 模擬 PLC：狀態去重與 5 秒冷卻，避免臨界值附近設備頻繁開關。 |
+| **認證** | 使用者端 JWT（HS256，bcrypt 雜湊管理員密碼）；IoT 裝置與手機端使用 `X-API-Key`（常數時間比對）。所有金鑰由環境變數提供，未設定即停用登入。 |
+| **快取** | 歷史數據查詢以 Redis 快取 10 秒；Redis 不可用時自動退回直查 MySQL。 |
+| **警報** | Telegram Bot 推播（含標註圖片），於背景任務送出，不拖慢 API 回應。 |
+| **儀表板** | React + TypeScript，登入、10 秒自動更新、錯誤提示。 |
+| **維運** | Loguru 日誌輪替、`cleanup.py` 清理舊資料、Docker healthcheck、GitHub Actions（pytest + 前端 lint/build）。 |
 
----
+## 架構
 
-## 📐 系統架構圖 (System Architecture)
 ```mermaid
-graph TD;
-    A[農場實體攝影機 & 感測器] -->|IoT 數據 / 影像| B(FastAPI 後端大腦)
-    B -->|YOLOv8 / ONNX| C{病蟲害與成熟度分析}
-    B -->|溫濕度自動規則| D[自動控制器 Actuators]
-    B -->|Redis 快取| E[(Redis Cache)]
-    B -->|SQLAlchemy| F[(MySQL 中央資料庫)]
-    B -->|JWT 驗證| G[React 前端戰情室]
-    C -->|異常事件警報| H[Line Notify 推播]
+graph TD
+    S[感測器 sensors.py] -->|POST /sensors + API Key| API
+    M[手機巡檢頁 /] -->|POST /detect_bugs + API Key| API
+    D[React 儀表板] -->|JWT| API
+    subgraph API[FastAPI]
+        R[規則引擎] --> ACT[Actuators]
+        INF[YOLO 昆蟲偵測 → 病變分類]
+    end
+    API --> DB[(MySQL)]
+    API <--> RC[(Redis 快取)]
+    API -->|背景任務| TG[Telegram]
 ```
 
----
+## 模型成效
 
-## 📂 專案目錄結構 (Project Structure)
+昆蟲偵測（YOLOv8s，12 類，416×416，30 epochs，Apple M-series MPS 訓練約 2 小時），驗證集：
+
+| Precision | Recall | mAP@50 | mAP@50-95 |
+|---|---|---|---|
+| 0.85 | 0.72 | 0.77 | 0.46 |
+
+![confusion matrix](docs/insect_confusion_matrix.png)
+![training curves](docs/insect_training_curves.png)
+
+類別：Ants, Bees, Beetles, Caterpillars, Earthworms, Earwigs, Grasshoppers, Moths, Slugs, Snails, Wasps, Weevils。葉片病變分類模型由 `train.py` 訓練，尚未附上量化指標。
+
+## 快速開始
+
+### Docker（建議）
+
+```bash
+cp .env.example .env     # 填入所有 change_me；缺少必要值時 compose 會直接報錯
+docker compose up --build -d
+```
+
+| 服務 | 位址 |
+|---|---|
+| 儀表板 | http://localhost:3000 |
+| API 文件（Swagger） | http://localhost:8001/docs |
+| 手機巡檢頁 | http://localhost:8001/ |
+
+模型權重不在 repo 內：訓練後放到 `result/train/weights/best.pt`（昆蟲）與 `result/runs/classify/train/weights/best.pt`（病變），或以 `python export_onnx.py` 轉成 `.onnx`。找不到時退回通用 `yolov8s.pt`，僅供展示。
+
+模擬感測器上報：
+
+```bash
+pip install -r requirements.txt
+SENSOR_API_URL=http://localhost:8001/api/v1/sensors python sensors.py
+```
+
+### 本機開發與測試
+
+```bash
+pip install -r requirements-dev.txt
+pytest -q                        # 使用 SQLite、不載入模型，不需 MySQL / Redis
+
+cd frontend && cp .env.example .env && npm ci && npm run dev
+```
+
+## API
+
+| Method | Path | 驗證 | 說明 |
+|---|---|---|---|
+| POST | `/api/v1/login` | — | 取得 JWT |
+| POST | `/api/v1/sensors` | API Key | 上報感測值，回傳觸發的自動控制 |
+| POST | `/api/v1/detect_bugs` | JWT 或 API Key | 上傳圖片（≤ 8 MB，僅限 image/*）進行診斷 |
+| GET | `/api/v1/sensors/history` | JWT | 最近 24 筆感測紀錄 |
+| GET | `/api/v1/tasks/history` | JWT | 最近 20 筆偵測紀錄 |
+| GET | `/api/v1/health` | — | 健康檢查 |
+
+## 專案結構
 
 ```text
-SMART_ECO_FARM/
-├── .github/workflows/    # CI/CD 自動化測試腳本
-├── frontend/             # React + Vite 現代化前端戰情室
-├── logs/                 # Loguru 結構化日誌存放區
-├── database.py           # SQLAlchemy ORM 結構與資料庫連線
-├── main.py               # FastAPI 核心大腦路由與推論邏輯
-├── auth.py               # JWT 驗證與加密核心
-├── notifier.py           # Line Notify 自動推播模組
-├── cleanup.py            # 過期影像與資料庫紀錄清理排程
-├── export_onnx.py        # YOLO 模型轉 ONNX 腳本
-├── test_main.py          # PyTest 測試腳本
-├── docker-compose.yml    # 微服務環境一鍵啟動配置
-└── .env                  # 資料庫連線、金鑰與 LINE Token 管理
+main.py            FastAPI 應用：路由、規則引擎、推論流程
+auth.py            JWT 與 API Key 驗證
+settings.py        環境變數集中管理
+database.py        SQLAlchemy 模型與預設規則
+actuators.py       風扇／水泵控制抽象層（模擬）
+notifier.py        Telegram 推播
+sensors.py         模擬 IoT 感測器
+cleanup.py         過期資料與影像清理
+train.py / train_insect.py / export_onnx.py   訓練與 ONNX 匯出
+farm_app.py        早期 Streamlit 版儀表板（選用，見 requirements-extras.txt）
+frontend/          React 儀表板
+test_main.py       pytest 測試
 ```
 
----
+## 已知限制與未來規劃
 
-## 🛠️ 快速開始 (Getting Started)
+- 單一管理員帳號（來自環境變數），尚無多使用者與角色權限。
+- 執行器為軟體模擬；真實部署需接 MQTT／GPIO。規則以「任一條成立即 ON」評估，尚無遲滯（hysteresis）。
+- 設備狀態存在 API 程序記憶體內，多 worker 部署需改存 Redis。
+- 尚未做壓力測試，不宣稱吞吐量；若要擴充可考慮批次寫入或訊息佇列。
+- 資料表以 `create_all` 建立，尚未導入 Alembic migration。
+- 病變分類模型尚缺評估指標與資料集來源說明。
 
-本系統支援 **Docker 一鍵部署**，強烈建議使用 Docker 啟動，避免環境衝突。
+## License
 
-1. **環境配置:**
-   請在根目錄修改 `.env` 檔案（填寫 `LINE_NOTIFY_TOKEN` 以啟用警報）。
-
-2. **一鍵啟動所有微服務:**
-   ```bash
-   docker-compose up --build -d
-   ```
-   系統將同時啟動：
-   * `farm_mysql`: MySQL 資料庫 (Port: 3308)
-   * `farm_redis`: Redis 快取 (Port: 6379)
-   * `farm_backend`: FastAPI 後端大腦 (Port: 8001)
-   * `react_web_service`: React 前端戰情室 (Port: 3000)
-
-3. **瀏覽戰情室:**
-   打開瀏覽器訪問 `http://localhost:3000`
-
----
-
-## 📈 DevOps 與自動化測試
-若您希望在本地開發並測試：
-```bash
-# 安裝依賴
-pip install -r requirements.txt
-
-# 執行自動化測試
-pytest test_main.py
-```
-本專案已整合 GitHub Actions，推送程式碼將自動觸發 `main.yml` 檢查。
+MIT
