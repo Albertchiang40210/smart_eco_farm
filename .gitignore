@@ -6,3 +6,13 @@ __pycache__/
 insect_dataset/
 result/
 *.jpg
+.env
+logs/
+*.pt
+*.onnx
+*.cache
+phone_upload_queue/
+sampled_dataset/
+*.db
+node_modules/
+frontend/dist/

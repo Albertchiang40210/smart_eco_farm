@@ -1,0 +1,10 @@
+.venv
+.git
+__pycache__
+insect_dataset
+sampled_dataset
+phone_upload_queue
+frontend
+logs
+*.db
+.env
